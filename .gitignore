@@ -1,0 +1,7 @@
+output/
+.idea/
+*.iml
+.venv/
+photoa/
+photob/
+photoc/
