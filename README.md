@@ -18,14 +18,14 @@
 
 ### 原版 vs LUT调色效果
 
-| 原版                                        | LUT仿色效果                                    |
-|-------------------------------------------|--------------------------------------------|
-| 理光负片![原版理光负片](demo/R0000638_neg_orig.jpg) | 理光负片LUT![负片LUT](demo/R0000638_neg_lut.jpg) |
-| 理光正片![原版理光正片](demo/R0000638_pos_orig.jpg) | 理光正片LUT![正片LUT](demo/R0000638_pos_lut.jpg) |
+| 原版                                       | LUT仿色效果                                   |
+|------------------------------------------|-------------------------------------------|
+| 理光负片![原版理光负片](art/R0000638_neg_orig.jpg) | 理光负片LUT![负片LUT](art/R0000638_neg_lut.jpg) |
+| 理光正片![原版理光正片](art/R0000638_pos_orig.jpg) | 理光正片LUT![正片LUT](art/R0000638_pos_lut.jpg) |
 
 ### Adobe Color 参考
 
-![Adobe Color参考](demo/R0000638_adobe_color.jpg)
+![Adobe Color参考](art/R0000638_adobe_color.jpg)
 
 从以上对比图可以看出，3D LUT Creator能够：
 - 准确还原色彩分级效果
