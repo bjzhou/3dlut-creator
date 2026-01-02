@@ -10,6 +10,149 @@ import os
 import torch
 TORCH_AVAILABLE = True
 
+
+class GPUColorMappings:
+    """
+    GPU-native color mappings using tensors instead of dict.
+    Keeps all data on GPU to eliminate CPU-GPU transfers.
+    """
+    
+    def __init__(self, device='cuda'):
+        """
+        Initialize GPU color mappings
+        
+        Args:
+            device: GPU device ('cuda' or 'mps')
+        """
+        self.device = torch.device(device)
+        self.keys_tensor = None      # (N, 3) RGB input colors on GPU
+        self.values_tensor = None    # (N, 3) RGB output colors on GPU
+        
+    def add_batch(self, new_keys: torch.Tensor, new_values: torch.Tensor):
+        """
+        Add a batch of mappings (already on GPU)
+        
+        Args:
+            new_keys: (M, 3) tensor of input RGB colors
+            new_values: (M, 3) tensor of output RGB colors
+        """
+        if self.keys_tensor is None:
+            self.keys_tensor = new_keys
+            self.values_tensor = new_values
+        else:
+            # Concatenate tensors (GPU operation, no CPU transfer)
+            self.keys_tensor = torch.cat([self.keys_tensor, new_keys], dim=0)
+            self.values_tensor = torch.cat([self.values_tensor, new_values], dim=0)
+    
+    def unique_and_merge(self):
+        """
+        Remove duplicate keys and average their values (all on GPU)
+        """
+        if self.keys_tensor is None:
+            return
+        
+        # Encode RGB to single integer key for uniqueness
+        encoded = (self.keys_tensor[:, 0].long() + 
+                   self.keys_tensor[:, 1].long() * 256 + 
+                   self.keys_tensor[:, 2].long() * 65536)
+        
+        # Find unique keys (GPU operation)
+        unique_encoded, inverse_indices = torch.unique(encoded, return_inverse=True)
+        n_unique = len(unique_encoded)
+        
+        # Calculate average values for each unique key
+        merged_values = torch.zeros(n_unique, 3, dtype=torch.float32, device=self.device)
+        counts = torch.bincount(inverse_indices, minlength=n_unique)
+        
+        indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
+        merged_values.scatter_add_(0, indices_expanded, self.values_tensor.float())
+        merged_values = merged_values / counts.unsqueeze(1).float()
+        
+        # Decode unique keys back to RGB
+        merged_keys = torch.zeros(n_unique, 3, dtype=torch.float32, device=self.device)
+        merged_keys[:, 0] = unique_encoded % 256
+        merged_keys[:, 1] = (unique_encoded // 256) % 256
+        merged_keys[:, 2] = unique_encoded // 65536
+        
+        self.keys_tensor = merged_keys
+        self.values_tensor = merged_values
+    
+    def compress_spatial(self, threshold: float = 3.0):
+        """
+        Compress mappings by merging spatially close colors (all on GPU)
+        
+        Args:
+            threshold: Distance threshold for merging
+        """
+        if self.keys_tensor is None or len(self.keys_tensor) < 10000:
+            return
+        
+        grid_size = int(threshold * 2)
+        
+        # Calculate grid indices
+        grid_indices = (self.keys_tensor / grid_size).long()
+        
+        # Encode grid position as single key
+        grid_keys = (grid_indices[:, 0] + 
+                     grid_indices[:, 1] * 10000 + 
+                     grid_indices[:, 2] * 100000000)
+        
+        # Find unique grids
+        unique_grids, inverse_indices = torch.unique(grid_keys, return_inverse=True)
+        n_grids = len(unique_grids)
+        
+        # Aggregate colors within each grid
+        compressed_keys = torch.zeros(n_grids, 3, dtype=torch.float32, device=self.device)
+        compressed_values = torch.zeros(n_grids, 3, dtype=torch.float32, device=self.device)
+        counts = torch.bincount(inverse_indices, minlength=n_grids)
+        
+        indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
+        compressed_keys.scatter_add_(0, indices_expanded, self.keys_tensor)
+        compressed_values.scatter_add_(0, indices_expanded, self.values_tensor)
+        
+        # Calculate averages
+        compressed_keys = compressed_keys / counts.unsqueeze(1).float()
+        compressed_values = compressed_values / counts.unsqueeze(1).float()
+        
+        self.keys_tensor = compressed_keys
+        self.values_tensor = compressed_values
+    
+    def to_dict(self) -> Dict[Tuple[int, int, int], Tuple[int, int, int]]:
+        """
+        Convert to dict (downloads from GPU to CPU - use only when needed)
+        
+        Returns:
+            Dictionary of color mappings
+        """
+        if self.keys_tensor is None:
+            return {}
+        
+        # Download to CPU
+        keys_cpu = self.keys_tensor.cpu().numpy()
+        values_cpu = self.values_tensor.cpu().numpy()
+        
+        # Build dict
+        result = {}
+        for i in range(len(keys_cpu)):
+            key_tuple = tuple(keys_cpu[i].astype(int))
+            value_tuple = tuple(np.round(values_cpu[i]).astype(int))
+            result[key_tuple] = value_tuple
+        
+        return result
+    
+    def size(self) -> int:
+        """Return number of mappings"""
+        return 0 if self.keys_tensor is None else len(self.keys_tensor)
+    
+    def clear_memory(self):
+        """Release GPU memory"""
+        del self.keys_tensor, self.values_tensor
+        self.keys_tensor = None
+        self.values_tensor = None
+        if 'cuda' in str(self.device):
+            torch.cuda.empty_cache()
+
+
 class LUT3DGeneratorStepwise:
     """Stepwise 3D LUT generator - processes images one by one to avoid memory issues"""
 
@@ -42,10 +185,222 @@ class LUT3DGeneratorStepwise:
             self.device = device
 
         self.torch_available = TORCH_AVAILABLE and self.device != 'cpu'
+        
+        # Enable GPU acceleration for pixel collection (can be disabled if needed)
+        self.use_gpu_for_pixel_collection = self.torch_available
+        if self.use_gpu_for_pixel_collection:
+            print(f"GPU acceleration enabled for pixel collection on {self.device.upper()}")
+
 
     def process_image_pair(self, photoa_path: str, photob_path: str) -> Dict[Tuple[int, int, int], Tuple[int, int, int]]:
         """
-        Process a single image pair and return partial LUT contribution (OPTIMIZED VERSION)
+        Process a single image pair and return partial LUT contribution
+        Automatically selects GPU or CPU processing based on availability
+
+        Args:
+            photoa_path: Base image path
+            photob_path: Mapped image path
+
+        Returns:
+            Dictionary of color mappings
+        """
+        if self.use_gpu_for_pixel_collection:
+            try:
+                return self.process_image_pair_gpu(photoa_path, photob_path)
+            except Exception as e:
+                print(f"  警告: GPU处理失败，回退到CPU模式: {e}")
+                return self.process_image_pair_cpu(photoa_path, photob_path)
+        else:
+            return self.process_image_pair_cpu(photoa_path, photob_path)
+
+    def process_image_pair_gpu(self, photoa_path: str, photob_path: str) -> Dict[Tuple[int, int, int], Tuple[int, int, int]]:
+        """
+        Process a single image pair using GPU acceleration and return partial LUT contribution
+
+        Args:
+            photoa_path: Base image path
+            photob_path: Mapped image path
+
+        Returns:
+            Dictionary of color mappings
+        """
+        filename = os.path.basename(photoa_path)
+        print(f"处理图片对 [GPU]: {filename}")
+
+        # Load images
+        from PIL import Image
+        try:
+            img_a = Image.open(photoa_path)
+            img_b = Image.open(photob_path)
+
+            # Convert to RGB if needed
+            if img_a.mode != 'RGB':
+                img_a = img_a.convert('RGB')
+            if img_b.mode != 'RGB':
+                img_b = img_b.convert('RGB')
+
+            rgb_a = np.array(img_a, dtype=np.uint8)
+            rgb_b = np.array(img_b, dtype=np.uint8)
+
+            if rgb_a.shape != rgb_b.shape:
+                print(f"警告: 图片尺寸不一致，跳过 {photoa_path}")
+                return {}
+
+        except Exception as e:
+            print(f"读取图片失败 {photoa_path}: {e}")
+            return {}
+
+        # Extract unique color mappings using GPU-accelerated operations
+        height, width = rgb_a.shape[:2]
+        total_pixels = height * width
+
+        print(f"  提取颜色映射 ({width}x{height} = {total_pixels:,} 像素) [GPU加速]...")
+        start_time = time.time()
+
+        # Move data to GPU
+        device = torch.device(self.device)
+        
+        # Reshape to (N, 3) and convert to torch tensors
+        pixels_a = torch.from_numpy(rgb_a.reshape(-1, 3)).to(device)
+        pixels_b = torch.from_numpy(rgb_b.reshape(-1, 3)).to(device)
+
+        # Encode RGB to unique keys using GPU
+        # keys = R + G*256 + B*65536
+        keys_a = (pixels_a[:, 0].long() + 
+                  pixels_a[:, 1].long() * 256 + 
+                  pixels_a[:, 2].long() * 65536)
+
+        # Get unique keys and inverse indices using PyTorch
+        unique_keys, inverse_indices = torch.unique(keys_a, return_inverse=True)
+
+        # Count occurrences of each unique color
+        # bincount requires non-negative integers
+        counts = torch.bincount(inverse_indices, minlength=len(unique_keys))
+
+        # Calculate sum of R, G, B channels for each unique key
+        # Use scatter_add for efficient grouping
+        n_unique = len(unique_keys)
+        sum_rgb = torch.zeros(n_unique, 3, dtype=torch.float32, device=device)
+        
+        # Expand inverse_indices for scatter_add: (N,) -> (N, 3)
+        indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
+        
+        # Sum pixels_b values grouped by inverse_indices
+        sum_rgb.scatter_add_(0, indices_expanded, pixels_b.float())
+
+        # Calculate mean (sum / count)
+        # counts: (N,) -> (N, 1) for broadcasting
+        counts_expanded = counts.unsqueeze(1).float()
+        mean_rgb = sum_rgb / counts_expanded  # (N, 3)
+
+        # Move results back to CPU and convert to numpy
+        unique_keys_cpu = unique_keys.cpu().numpy()
+        mean_rgb_cpu = mean_rgb.cpu().numpy()
+
+        # Build result dictionary
+        unique_mappings = {}
+
+        # Decode RGB from keys
+        in_r = (unique_keys_cpu % 256).astype(int)
+        in_g = ((unique_keys_cpu // 256) % 256).astype(int)
+        in_b = (unique_keys_cpu // 65536).astype(int)
+
+        # Assemble mappings
+        for i in range(len(unique_keys_cpu)):
+            k_in = (in_r[i], in_g[i], in_b[i])
+            v_out = (int(round(mean_rgb_cpu[i, 0])), 
+                     int(round(mean_rgb_cpu[i, 1])), 
+                     int(round(mean_rgb_cpu[i, 2])))
+            unique_mappings[k_in] = v_out
+
+        # Clean up GPU memory
+        del pixels_a, pixels_b, keys_a, unique_keys, inverse_indices, counts, sum_rgb, mean_rgb
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+
+        elapsed = time.time() - start_time
+        speedup_hint = ""
+        if hasattr(self, '_last_cpu_time') and self._last_cpu_time > 0:
+            speedup = self._last_cpu_time / elapsed
+            speedup_hint = f" [加速: {speedup:.1f}x vs CPU]"
+        print(f"  提取到 {len(unique_mappings)} 个唯一颜色映射 (耗时: {elapsed:.2f}秒) [GPU: {elapsed*1000:.0f}ms]{speedup_hint}")
+
+        return unique_mappings
+
+    def process_image_pair_gpu_native(self, photoa_path: str, photob_path: str, 
+                                        gpu_mappings: GPUColorMappings):
+        """
+        Process image pair and add directly to GPU tensor (zero-copy)
+        
+        Args:
+            photoa_path: Base image path
+            photob_path: Mapped image path
+            gpu_mappings: GPUColorMappings object to add results to
+        """
+        filename = os.path.basename(photoa_path)
+        
+        # Load images
+        from PIL import Image
+        try:
+            img_a = Image.open(photoa_path)
+            img_b = Image.open(photob_path)
+
+            if img_a.mode != 'RGB':
+                img_a = img_a.convert('RGB')
+            if img_b.mode != 'RGB':
+                img_b = img_b.convert('RGB')
+
+            rgb_a = np.array(img_a, dtype=np.uint8)
+            rgb_b = np.array(img_b, dtype=np.uint8)
+
+            if rgb_a.shape != rgb_b.shape:
+                print(f"  ⚠ 跳过: {filename}")
+                return
+
+        except Exception as e:
+            print(f"  ⚠ 失败: {filename}")
+            return
+
+        # Process on GPU
+        start_time = time.time()
+        device = torch.device(self.device)
+        
+        pixels_a = torch.from_numpy(rgb_a.reshape(-1, 3)).to(device)
+        pixels_b = torch.from_numpy(rgb_b.reshape(-1, 3)).to(device)
+
+        # Encode & unique (GPU)
+        keys_a = (pixels_a[:, 0].long() + 
+                  pixels_a[:, 1].long() * 256 + 
+                  pixels_a[:, 2].long() * 65536)
+
+        unique_keys, inverse_indices = torch.unique(keys_a, return_inverse=True)
+        counts = torch.bincount(inverse_indices, minlength=len(unique_keys))
+
+        sum_rgb = torch.zeros(len(unique_keys), 3, dtype=torch.float32, device=device)
+        indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
+        sum_rgb.scatter_add_(0, indices_expanded, pixels_b.float())
+        mean_rgb = sum_rgb / counts.unsqueeze(1).float()
+
+        # Decode keys (GPU)
+        unique_rgb_keys = torch.zeros(len(unique_keys), 3, dtype=torch.float32, device=device)
+        unique_rgb_keys[:, 0] = unique_keys % 256
+        unique_rgb_keys[:, 1] = (unique_keys // 256) % 256
+        unique_rgb_keys[:, 2] = unique_keys // 65536
+
+        # Add to GPU mappings (NO CPU DOWNLOAD!)
+        gpu_mappings.add_batch(unique_rgb_keys, mean_rgb)
+
+        # Clean up
+        del pixels_a, pixels_b, keys_a, unique_keys, inverse_indices, sum_rgb
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+
+        elapsed = time.time() - start_time
+        print(f"  ✓ {filename}: {len(unique_rgb_keys):,} colors ({elapsed*1000:.0f}ms)")
+
+    def process_image_pair_cpu(self, photoa_path: str, photob_path: str) -> Dict[Tuple[int, int, int], Tuple[int, int, int]]:
+        """
+        Process a single image pair using CPU and return partial LUT contribution (OPTIMIZED VERSION)
 
         Args:
             photoa_path: Base image path
@@ -133,7 +488,8 @@ class LUT3DGeneratorStepwise:
             unique_mappings[k_in] = v_out
 
         elapsed = time.time() - start_time
-        print(f"  提取到 {len(unique_mappings)} 个唯一颜色映射 (耗时: {elapsed:.2f}秒)")
+        self._last_cpu_time = elapsed  # 保存用于对比
+        print(f"  提取到 {len(unique_mappings)} 个唯一颜色映射 (耗时: {elapsed:.2f}秒) [CPU]")
 
         return unique_mappings
 
@@ -252,6 +608,116 @@ class LUT3DGeneratorStepwise:
             inferred_rgb.append(int(round(predicted)))
 
         return tuple(inferred_rgb)
+
+    def rgb_to_lab_gpu(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert RGB to LAB color space on GPU using PyTorch
+        
+        Args:
+            rgb_tensor: RGB tensor in range [0, 255], shape (..., 3), on GPU
+        
+        Returns:
+            LAB tensor, L in [0, 100], a and b in approximately [-128, 127]
+        """
+        # Normalize RGB to [0, 1]
+        rgb_normalized = rgb_tensor / 255.0
+        
+        # Convert to linear RGB (inverse sRGB gamma correction)
+        mask = rgb_normalized > 0.04045
+        rgb_linear = torch.where(
+            mask,
+            torch.pow((rgb_normalized + 0.055) / 1.055, 2.4),
+            rgb_normalized / 12.92
+        )
+        
+        # RGB to XYZ conversion matrix (D65 illuminant)
+        rgb_to_xyz_matrix = torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041]
+        ], dtype=torch.float32, device=rgb_tensor.device)
+        
+        # Convert to XYZ
+        xyz = rgb_linear @ rgb_to_xyz_matrix.T
+        
+        # Normalize by D65 white point
+        d65_white = torch.tensor([0.95047, 1.00000, 1.08883], 
+                                 dtype=torch.float32, device=rgb_tensor.device)
+        xyz_n = xyz / d65_white
+        
+        # XYZ to LAB conversion
+        delta = 6.0 / 29.0
+        mask = xyz_n > delta ** 3
+        f_xyz = torch.where(
+            mask,
+            torch.pow(xyz_n, 1.0 / 3.0),
+            (xyz_n / (3.0 * delta ** 2)) + (4.0 / 29.0)
+        )
+        
+        # Calculate LAB values
+        L = 116.0 * f_xyz[..., 1] - 16.0
+        a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
+        b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+        
+        return torch.stack([L, a, b], dim=-1)
+
+    def lab_to_rgb_gpu(self, lab_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert LAB back to RGB color space on GPU using PyTorch
+        
+        Args:
+            lab_tensor: LAB tensor, L in [0, 100], a and b in approximately [-128, 127]
+        
+        Returns:
+            RGB tensor in range [0, 255], shape (..., 3)
+        """
+        L, a, b = lab_tensor[..., 0], lab_tensor[..., 1], lab_tensor[..., 2]
+        
+        # LAB to XYZ conversion
+        fy = (L + 16.0) / 116.0
+        fx = a / 500.0 + fy
+        fz = fy - b / 200.0
+        
+        delta = 6.0 / 29.0
+        
+        # Inverse f function
+        mask_x = fx > delta
+        mask_y = fy > delta
+        mask_z = fz > delta
+        
+        xyz_normalized = torch.stack([
+            torch.where(mask_x, fx ** 3, 3.0 * delta ** 2 * (fx - 4.0 / 29.0)),
+            torch.where(mask_y, fy ** 3, 3.0 * delta ** 2 * (fy - 4.0 / 29.0)),
+            torch.where(mask_z, fz ** 3, 3.0 * delta ** 2 * (fz - 4.0 / 29.0))
+        ], dim=-1)
+        
+        # Denormalize by D65 white point
+        d65_white = torch.tensor([0.95047, 1.00000, 1.08883],
+                                 dtype=torch.float32, device=lab_tensor.device)
+        xyz = xyz_normalized * d65_white
+        
+        # XYZ to RGB conversion matrix (D65 illuminant)
+        xyz_to_rgb_matrix = torch.tensor([
+            [ 3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660,  1.8760108,  0.0415560],
+            [ 0.0556434, -0.2040259,  1.0572252]
+        ], dtype=torch.float32, device=lab_tensor.device)
+        
+        # Convert to linear RGB
+        rgb_linear = xyz @ xyz_to_rgb_matrix.T
+        
+        # Apply sRGB gamma correction
+        mask = rgb_linear > 0.0031308
+        rgb_normalized = torch.where(
+            mask,
+            1.055 * torch.pow(rgb_linear, 1.0 / 2.4) - 0.055,
+            12.92 * rgb_linear
+        )
+        
+        # Convert to [0, 255] range and clip
+        rgb = torch.clamp(rgb_normalized * 255.0, 0, 255)
+        
+        return rgb
 
     @staticmethod
     def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
@@ -447,6 +913,96 @@ class LUT3DGeneratorStepwise:
 
         return compressed_mappings
 
+    def compress_color_mappings_gpu(self, color_mapping_dict: Dict[Tuple[int, int, int], Tuple[int, int, int]],
+                                     similarity_threshold: float = 3.0) -> Dict[Tuple[int, int, int], Tuple[int, int, int]]:
+        """
+        GPU-accelerated color mapping compression using spatial hashing
+        
+        Args:
+            color_mapping_dict: Original color mapping dictionary
+            similarity_threshold: Color distance threshold for merging
+        
+        Returns:
+            Compressed color mapping dictionary
+        """
+        print(f"GPU压缩颜色映射，相似度阈值: {similarity_threshold}...")
+        original_count = len(color_mapping_dict)
+        
+        if original_count < 10000:
+            print(f"数据集较小 ({original_count})，跳过压缩")
+            return color_mapping_dict
+        
+        if not TORCH_AVAILABLE or self.device == 'cpu':
+            print("GPU不可用，回退到CPU压缩")
+            return self.compress_color_mappings(color_mapping_dict, similarity_threshold)
+        
+        start_time = time.time()
+        device = torch.device(self.device)
+        
+        # 转换为GPU tensor
+        keys = np.array(list(color_mapping_dict.keys()), dtype=np.float32)
+        values = np.array(list(color_mapping_dict.values()), dtype=np.float32)
+        
+        keys_tensor = torch.from_numpy(keys).to(device)
+        values_tensor = torch.from_numpy(values).to(device)
+        
+        # 使用空间哈希进行高效聚类
+        grid_size = int(similarity_threshold * 2)
+        
+        # 计算每个点的grid索引
+        grid_indices = (keys_tensor / grid_size).long()
+        
+        # 编码grid位置为单一索引（用于unique操作）
+        # grid_key = x + y*10000 + z*100000000
+        grid_keys = (grid_indices[:, 0] + 
+                     grid_indices[:, 1] * 10000 + 
+                     grid_indices[:, 2] * 100000000)
+        
+        # 找到唯一的grid并分组
+        unique_grids, inverse_indices = torch.unique(grid_keys, return_inverse=True)
+        n_grids = len(unique_grids)
+        
+        # 对每个grid计算平均值
+        merged_keys = torch.zeros(n_grids, 3, dtype=torch.float32, device=device)
+        merged_values = torch.zeros(n_grids, 3, dtype=torch.float32, device=device)
+        counts = torch.bincount(inverse_indices, minlength=n_grids)
+        
+        # 使用scatter_add累加
+        indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
+        merged_keys.scatter_add_(0, indices_expanded, keys_tensor)
+        merged_values.scatter_add_(0, indices_expanded, values_tensor)
+        
+        # 计算平均值
+        counts_expanded = counts.unsqueeze(1).float()
+        merged_keys = merged_keys / counts_expanded
+        merged_values = merged_values / counts_expanded
+        
+        # 转回CPU并构建字典
+        merged_keys_cpu = merged_keys.cpu().numpy()
+        merged_values_cpu = merged_values.cpu().numpy()
+        
+        compressed_mappings = {}
+        for i in range(n_grids):
+            key_tuple = tuple(merged_keys_cpu[i].astype(int))
+            value_tuple = tuple(np.round(merged_values_cpu[i]).astype(int))
+            compressed_mappings[key_tuple] = value_tuple
+        
+        # 清理GPU内存
+        del keys_tensor, values_tensor, grid_indices, grid_keys
+        del unique_grids, inverse_indices, merged_keys, merged_values
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+        
+        elapsed = time.time() - start_time
+        compression_ratio = (1 - len(compressed_mappings) / original_count) * 100
+        total_merged = original_count - len(compressed_mappings)
+        
+        print(f"GPU压缩完成: {original_count:,} → {len(compressed_mappings):,} 个映射点")
+        print(f"压缩率: {compression_ratio:.1f}% (合并了 {total_merged:,} 个相似点)")
+        print(f"GPU压缩耗时: {elapsed:.2f}秒")
+        
+        return compressed_mappings
+
     def fast_interpolation_gpu(self, grid_points: np.ndarray,
                                color_mapping_dict: Dict[Tuple[int, int, int], Tuple[int, int, int]]) -> np.ndarray:
         """
@@ -461,18 +1017,19 @@ class LUT3DGeneratorStepwise:
         device = torch.device(self.device)
         n_grid_points = grid_points.shape[0]
 
-        # 1. 预处理数据 (LAB 转换也应该移到 GPU 以减少传输，这里暂保持原样)
+        # 1. 使用GPU进行RGB到LAB转换（避免CPU-GPU传输）
         mapping_keys_rgb = np.array(list(color_mapping_dict.keys()), dtype=np.float32)
         mapping_values_rgb = np.array(list(color_mapping_dict.values()), dtype=np.float32)
 
-        mapping_keys_lab = self.rgb_to_lab(mapping_keys_rgb)
-        mapping_values_lab = self.rgb_to_lab(mapping_values_rgb)
-        query_points_lab = self.rgb_to_lab(grid_points)
+        # 转换为GPU张量
+        mapping_keys_rgb_tensor = torch.from_numpy(mapping_keys_rgb).to(device)
+        mapping_values_rgb_tensor = torch.from_numpy(mapping_values_rgb).to(device)
+        grid_points_tensor = torch.from_numpy(grid_points).to(device)
 
-        # 移入 GPU
-        mapping_keys = torch.tensor(mapping_keys_lab, dtype=torch.float32, device=device)
-        mapping_values = torch.tensor(mapping_values_lab, dtype=torch.float32, device=device)
-        query_points = torch.tensor(query_points_lab, dtype=torch.float32, device=device)
+        # GPU上执行RGB→LAB转换
+        mapping_keys = self.rgb_to_lab_gpu(mapping_keys_rgb_tensor)
+        mapping_values = self.rgb_to_lab_gpu(mapping_values_rgb_tensor)
+        query_points = self.rgb_to_lab_gpu(grid_points_tensor)
 
         # 2. 动态调整 Batch Size
         # cdist 会生成 (Batch, N_mapping) 的矩阵。如果 N_mapping 很大 (如 10w)，
@@ -541,10 +1098,12 @@ class LUT3DGeneratorStepwise:
 
         print(f"\nGPU插值完成，耗时: {time.time() - start_time:.2f}秒")
 
-        # 转回 CPU
-        result_lab = result.cpu().numpy()
+        # 转换插值结果从LAB回RGB空间（GPU上完成）
         print("转换插值结果从LAB回RGB空间...")
-        return self.lab_to_rgb(result_lab)
+        result_rgb_tensor = self.lab_to_rgb_gpu(result)
+        result_rgb = result_rgb_tensor.cpu().numpy()
+        
+        return result_rgb
 
     def fast_interpolation_cpu_fallback(self, grid_points: np.ndarray,
                                        color_mapping_dict: Dict[Tuple[int, int, int], Tuple[int, int, int]]) -> np.ndarray:
@@ -672,6 +1231,12 @@ class LUT3DGeneratorStepwise:
         Returns:
             3D LUT data array with shape (lut_size, lut_size, lut_size, 3)
         """
+        if self.torch_available and self.device != 'cpu':
+            return self.generate_3d_lut_gpu_native(photoa_dir, photob_dir)
+        else:
+            return self.generate_3d_lut_cpu(photoa_dir, photob_dir, num_threads)
+
+    def generate_3d_lut_cpu(self, photoa_dir: str, photob_dir: str, num_threads: int = 4) -> np.ndarray:
         print(f"开始分步生成 {self.lut_size}x{self.lut_size}x{self.lut_size} 的3D LUT...")
         print(f"使用设备: {self.device.upper()}")
         print(f"使用 {num_threads} 个线程并行处理图片")
@@ -706,7 +1271,7 @@ class LUT3DGeneratorStepwise:
             """Wrapper function for thread pool"""
             photoa_path, photob_path = pair_tuple
 
-            # Process the image pair
+            # Process the image pair (auto GPU/CPU selection)
             image_mappings = self.process_image_pair(photoa_path, photob_path)
 
             # Thread-safe merge into all_color_mappings
@@ -767,15 +1332,8 @@ class LUT3DGeneratorStepwise:
         # Perform interpolation
         print(f"\n--- 插值计算 ---")
         interpolation_start = time.time()
-
-        # Compress color mappings to reduce computation
         compressed_mappings = self.compress_color_mappings(final_mappings, similarity_threshold=2)
-
-        # Use GPU acceleration if available
-        if self.torch_available:
-            mapped_colors = self.fast_interpolation_gpu(grid_points, compressed_mappings)
-        else:
-            mapped_colors = self.fast_interpolation_cpu_fallback(grid_points, compressed_mappings)
+        mapped_colors = self.fast_interpolation_cpu_fallback(grid_points, compressed_mappings)
 
         interpolation_time = time.time() - interpolation_start
         print(f"插值计算完成，耗时: {interpolation_time:.1f}秒")
@@ -795,70 +1353,172 @@ class LUT3DGeneratorStepwise:
         self.lut_data = lut_data_3d
         return lut_data_3d
 
-
-def test_stepwise_generator():
-    """Test the stepwise LUT generator"""
-    print("测试分步LUT生成器...")
-
-    # Create test directories and images
-    import os
-    from PIL import Image, ImageDraw
-
-    os.makedirs("test_photoa", exist_ok=True)
-    os.makedirs("test_photb", exist_ok=True)
-
-    # Create a few test images
-    for i in range(5):  # 5 pairs
-        # Base image (various colors)
-        img_a = Image.new('RGB', (200, 150))
-        draw_a = ImageDraw.Draw(img_a)
-
-        # Draw different color patterns
-        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
-        for x in range(200):
-            for y in range(150):
-                color_idx = (x + y + i * 50) % len(colors)
-                draw_a.point((x, y), colors[color_idx])
-
-        img_a.save(f"test_photoa/test_image_{i}.png")
-
-        # Mapped image (color shifted)
-        img_b = Image.new('RGB', (200, 150))
-        draw_b = ImageDraw.Draw(img_b)
-
-        for x in range(200):
-            for y in range(150):
-                r, g, b = draw_a.getpixel((x, y))
-                # Apply color transformation
-                new_r = min(255, int(r * 1.2))
-                new_g = min(255, int(g * 0.8))
-                new_b = min(255, int(b * 1.1))
-                draw_b.point((x, y), (new_r, new_g, new_b))
-
-        img_b.save(f"test_photb/test_image_{i}.png")
-
-    # Test the generator
-    print("测试分步生成器...")
-    generator = LUT3DGeneratorStepwise(lut_size=32, device='cpu')
-
-    try:
-        import time
+    def generate_3d_lut_gpu_native(self, photoa_dir: str, photob_dir: str) -> np.ndarray:
+        """
+        GPU-native LUT generation - all data stays on GPU until final output
+        Eliminates all intermediate CPU-GPU transfers
+        
+        Args:
+            photoa_dir: Directory containing base photos
+            photob_dir: Directory containing mapped photos
+            
+        Returns:
+            3D LUT data array
+        """
+        if not self.torch_available or self.device == 'cpu':
+            print("GPU not available, falling back to standard method")
+            return self.generate_3d_lut_stepwise(photoa_dir, photob_dir)
+        
+        print(f"\\n{'='*70}")
+        print(f"GPU-Native LUT生成 (零CPU传输模式)")
+        print(f"{'='*70}")
+        print(f"开始生成 {self.lut_size}x{self.lut_size}x{self.lut_size} 的3D LUT...")
+        print(f"使用设备: {self.device.upper()} (GPU-Native流程)")
+        
         start_time = time.time()
-
-        lut_data = generator.generate_3d_lut_stepwise("test_photoa", "test_photb")
-
-        end_time = time.time()
-        elapsed = end_time - start_time
-
-        print(f"\n✅ 测试成功!")
-        print(f"LUT数据形状: {lut_data.shape}")
-        print(f"生成时间: {elapsed:.2f}秒")
-
-    except Exception as e:
-        print(f"\n❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    test_stepwise_generator()
+        
+        # Find image pairs
+        photoa_files = sorted([os.path.join(photoa_dir, f) for f in os.listdir(photoa_dir)
+                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))])
+        
+        image_pairs = []
+        for photoa_path in photoa_files:
+            filename = os.path.basename(photoa_path)
+            photob_path = os.path.join(photob_dir, filename)
+            if os.path.exists(photob_path):
+                image_pairs.append((photoa_path, photob_path))
+        
+        print(f"找到 {len(image_pairs)} 对图片\\n")
+        
+        # Create GPU mappings object
+        gpu_mappings = GPUColorMappings(self.device)
+        
+        # Process all images (data stays on GPU)
+        print("阶段1: 像素收集 (GPU)")
+        print("-" * 70)
+        collection_start = time.time()
+        
+        for i, (photoa, photob) in enumerate(image_pairs, 1):
+            print(f"[{i}/{len(image_pairs)}] ", end="")
+            self.process_image_pair_gpu_native(photoa, photob, gpu_mappings)
+        
+        collection_time = time.time() - collection_start
+        print(f"\\n像素收集完成: {collection_time:.1f}秒 ({collection_time/len(image_pairs):.2f}秒/张)")
+        print(f"总映射数: {gpu_mappings.size():,}\\n")
+        
+        # Merge duplicates (GPU)
+        print("阶段2: 合并重复 (GPU)")
+        print("-" * 70)
+        merge_start = time.time()
+        gpu_mappings.unique_and_merge()
+        merge_time = time.time() - merge_start
+        print(f"合并完成: {gpu_mappings.size():,} 个唯一映射 ({merge_time:.2f}秒)\\n")
+        
+        # Compress (GPU)
+        print("阶段3: 空间压缩 (GPU)")
+        print("-" * 70)
+        compress_start = time.time()
+        original_size = gpu_mappings.size()
+        gpu_mappings.compress_spatial(threshold=2.0)
+        compress_time = time.time() - compress_start
+        compression_ratio = (1 - gpu_mappings.size() / original_size) * 100
+        print(f"压缩完成: {original_size:,} → {gpu_mappings.size():,} ({compression_ratio:.1f}% 压缩, {compress_time:.2f}秒)\\n")
+        
+        # Interpolate (GPU)
+        print("阶段4: LUT插值 (GPU)")
+        print("-" * 70)
+        interp_start = time.time()
+        
+        # Generate grid (直接在GPU上)
+        grid_points = self.generate_lut_grid()
+        grid_tensor = torch.from_numpy(grid_points).to(self.device)
+        
+        # Interpolate using GPU tensors
+        result_tensor = self.interpolate_gpu_tensor(grid_tensor, gpu_mappings)
+        
+        interp_time = time.time() - interp_start
+        print(f"插值完成: {len(grid_tensor):,} 个网格点 ({interp_time:.1f}秒)\\n")
+        
+        # Only now download to CPU
+        mapped_colors = result_tensor.cpu().numpy()
+        
+        # Clean up GPU
+        gpu_mappings.clear_memory()
+        del grid_tensor, result_tensor
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+        
+        # Convert to LUT format
+        mapped_colors_norm = mapped_colors / 255.0
+        mapped_colors_norm = np.clip(mapped_colors_norm, 0.0, 1.0)
+        lut_data_3d = mapped_colors_norm.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
+        
+        total_time = time.time() - start_time
+        print(f"{'='*70}")
+        print(f"✅ GPU-Native LUT生成完成!")
+        print(f"总耗时: {total_time:.1f}秒")
+        print(f"性能提升: 零CPU-GPU中间传输")
+        print(f"{'='*70}")
+        
+        self.lut_data = lut_data_3d
+        return lut_data_3d
+    
+    def interpolate_gpu_tensor(self, grid_tensor: torch.Tensor, 
+                                gpu_mappings: GPUColorMappings) -> torch.Tensor:
+        """
+        GPU-native interpolation using tensors (no CPU transfer)
+        
+        Args:
+            grid_tensor: (N, 3) grid points on GPU
+            gpu_mappings: GPUColorMappings with keys/values on GPU
+            
+        Returns:
+            (N, 3) interpolated colors tensor on GPU
+        """
+        # Convert to LAB (GPU)
+        grid_lab = self.rgb_to_lab_gpu(grid_tensor)
+        keys_lab = self.rgb_to_lab_gpu(gpu_mappings.keys_tensor)
+        values_lab = self.rgb_to_lab_gpu(gpu_mappings.values_tensor)
+        
+        # IDW interpolation (GPU)
+        n_grid = len(grid_lab)
+        n_mappings = len(keys_lab)
+        result_lab = torch.zeros_like(grid_lab)
+        
+        k = min(16, n_mappings)
+        batch_size = 5000
+        
+        print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k})")
+        
+        for batch_idx in range((n_grid + batch_size - 1) // batch_size):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_grid)
+            batch_points = grid_lab[start:end]
+            
+            # Calculate distances (GPU)
+            distances = torch.cdist(batch_points, keys_lab, p=2)
+            
+            # Find k nearest
+            topk_dists, topk_indices = torch.topk(distances, k=k, largest=False, dim=1)
+            
+            # IDW weights
+            epsilon = 1e-6
+            weights = 1.0 / (topk_dists + epsilon)
+            weights = weights / weights.sum(dim=1, keepdim=True)
+            
+            # Weighted sum
+            batch_neighbors = values_lab[topk_indices]
+            batch_result = (batch_neighbors * weights.unsqueeze(-1)).sum(dim=1)
+            
+            result_lab[start:end] = batch_result
+            
+            if (batch_idx + 1) % 5 == 0:
+                progress = (batch_idx + 1) / ((n_grid + batch_size - 1) // batch_size)
+                print(f"    进度: {progress:.1%}", end='\\r')
+        
+        print()
+        
+        # Convert back to RGB (GPU)
+        result_rgb = self.lab_to_rgb_gpu(result_lab)
+        
+        return result_rgb
