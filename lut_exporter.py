@@ -1,4 +1,5 @@
 import numpy as np
+import struct
 from typing import Optional, Tuple
 from lut_generator_stepwise import LUT3DGeneratorStepwise
 import os
@@ -126,6 +127,57 @@ class LUTExporter:
         np.save(filename, self.lut_data)
         print(f"NumPy文件导出完成: {os.path.abspath(filename)}")
 
+    def export_plut(self, filename: str):
+        """
+        导出为自定义二进制 .plut 格式文件 (用于Android OpenGL ES加载)
+
+        PLUT Format:
+            - Magic: 'PLUT' (4 bytes)
+            - Version: 1 (uint32, little-endian)
+            - Size: LUT dimension (uint32, little-endian)
+            - Data Type: 0 for UINT8 RGB (uint32, little-endian)
+            - Payload: Raw RGB data as uint8 values
+
+        Args:
+            filename: 输出文件名
+        """
+        print(f"导出PLUT格式LUT到: {filename}")
+
+        lut_size = self.lut_generator.lut_size
+        data = []
+
+        # Convert LUT data from float [0.0, 1.0] to uint8 [0, 255]
+        for b in range(lut_size):
+            for g in range(lut_size):
+                for r in range(lut_size):
+                    color = self.lut_data[b, g, r]
+                    # Convert each RGB component to uint8
+                    for i in range(3):
+                        val = max(0.0, min(1.0, color[i]))  # Clamp to [0, 1]
+                        data.append(int(val * 255.0 + 0.5))  # Round to nearest int
+
+        expected_count = lut_size * lut_size * lut_size * 3
+        if len(data) != expected_count:
+            print(f"警告: 数据长度不匹配. 期望 {expected_count}, 实际 {len(data)}")
+
+        with open(filename, 'wb') as f:
+            # Magic bytes
+            f.write(b'PLUT')
+            # Version (uint32, little-endian)
+            f.write(struct.pack('<I', 1))
+            # Size (uint32, little-endian)
+            f.write(struct.pack('<I', lut_size))
+            # Data Type: 0 = UINT8 (uint32, little-endian)
+            f.write(struct.pack('<I', 0))
+            # Payload: RGB data as bytes
+            f.write(bytes(data))
+
+        file_size = os.path.getsize(filename)
+        expected_size = 16 + expected_count  # 4 header fields * 4 bytes + data
+        print(f"PLUT文件导出完成: {os.path.abspath(filename)}")
+        print(f"  文件大小: {file_size:,} bytes (期望: {expected_size:,} bytes)")
+
+
     def export_image_preview(self, filename: str, size: Tuple[int, int] = (512, 512)):
         """
         导出LUT预览图像 (颜色网格可视化)
@@ -205,6 +257,11 @@ class LUTExporter:
             self.export_numpy(f"{base_filename}.npy")
         except Exception as e:
             print(f"NumPy格式导出失败: {e}")
+
+        try:
+            self.export_plut(f"{base_filename}.plut")
+        except Exception as e:
+            print(f"PLUT格式导出失败: {e}")
 
         try:
             self.export_image_preview(f"{base_filename}_preview.png")

@@ -75,8 +75,8 @@ Examples:
     parser.add_argument(
         '--formats',
         type=str,
-        default='all',
-        help='Export formats: cube,3dl,dat,npy,all (default: all)'
+        default='cube,plut',
+        help='Export formats: cube,3dl,dat,npy,plut,all (default: cube,plut)'
     )
 
     parser.add_argument(
@@ -194,7 +194,7 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
 
         # Export based on specified formats
-        formats = args.formats.lower().split(',') if args.formats != 'all' else ['cube', '3dl', 'dat', 'npy']
+        formats = args.formats.lower().split(',') if args.formats != 'all' else ['cube', '3dl', 'dat', 'npy', 'plut']
 
         exported_files = []
         export_start = time.time()
@@ -223,6 +223,12 @@ def main():
                 elif fmt == 'npy':
                     filename = f"{args.output}.npy"
                     exporter.export_numpy(filename)
+                    exported_files.append(filename)
+                    print(f"  ✓ {filename}")
+
+                elif fmt == 'plut':
+                    filename = f"{args.output}.plut"
+                    exporter.export_plut(filename)
                     exported_files.append(filename)
                     print(f"  ✓ {filename}")
 
