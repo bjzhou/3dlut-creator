@@ -1419,7 +1419,7 @@ class LUT3DGeneratorStepwise:
         print("-" * 70)
         compress_start = time.time()
         original_size = gpu_mappings.size()
-        gpu_mappings.compress_spatial(threshold=2.0)
+        gpu_mappings.compress_spatial(threshold=1.0)
         compress_time = time.time() - compress_start
         compression_ratio = (1 - gpu_mappings.size() / original_size) * 100
         print(f"压缩完成: {original_size:,} → {gpu_mappings.size():,} ({compression_ratio:.1f}% 压缩, {compress_time:.2f}秒)\\n")
