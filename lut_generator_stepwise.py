@@ -27,6 +27,8 @@ class GPUColorMappings:
         self.device = torch.device(device)
         self.keys_tensor = None      # (N, 3) RGB input colors on GPU
         self.values_tensor = None    # (N, 3) RGB output colors on GPU
+        self.weights_tensor = None   # (N,) Weights/counts for each mapping
+
         
     def add_batch(self, new_keys: torch.Tensor, new_values: torch.Tensor):
         """
@@ -39,10 +41,19 @@ class GPUColorMappings:
         if self.keys_tensor is None:
             self.keys_tensor = new_keys
             self.values_tensor = new_values
+            self.weights_tensor = torch.ones(len(new_keys), dtype=torch.float32, device=self.device)
         else:
             # Concatenate tensors (GPU operation, no CPU transfer)
             self.keys_tensor = torch.cat([self.keys_tensor, new_keys], dim=0)
             self.values_tensor = torch.cat([self.values_tensor, new_values], dim=0)
+            
+            # Handle weights
+            new_weights = torch.ones(len(new_keys), dtype=torch.float32, device=self.device)
+            if self.weights_tensor is None:
+                self.weights_tensor = torch.ones(len(self.keys_tensor) - len(new_keys), 
+                                               dtype=torch.float32, device=self.device)
+            self.weights_tensor = torch.cat([self.weights_tensor, new_weights], dim=0)
+
     
     def unique_and_merge(self):
         """
@@ -56,17 +67,27 @@ class GPUColorMappings:
                    self.keys_tensor[:, 1].long() * 256 + 
                    self.keys_tensor[:, 2].long() * 65536)
         
+        # Initialize weights if needed
+        if self.weights_tensor is None:
+            self.weights_tensor = torch.ones(len(self.keys_tensor), dtype=torch.float32, device=self.device)
+
         # Find unique keys (GPU operation)
         unique_encoded, inverse_indices = torch.unique(encoded, return_inverse=True)
         n_unique = len(unique_encoded)
         
-        # Calculate average values for each unique key
-        merged_values = torch.zeros(n_unique, 3, dtype=torch.float32, device=self.device)
-        counts = torch.bincount(inverse_indices, minlength=n_unique)
+        # Aggregate weights
+        merged_weights = torch.zeros(n_unique, dtype=torch.float32, device=self.device)
+        merged_weights.scatter_add_(0, inverse_indices, self.weights_tensor)
         
+        # Calculate weighted sum of values
+        merged_values = torch.zeros(n_unique, 3, dtype=torch.float32, device=self.device)
+        # Weighted values
+        weighted_values = self.values_tensor * self.weights_tensor.unsqueeze(1)
         indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
-        merged_values.scatter_add_(0, indices_expanded, self.values_tensor.float())
-        merged_values = merged_values / counts.unsqueeze(1).float()
+        merged_values.scatter_add_(0, indices_expanded, weighted_values)
+        
+        # Calculate averages
+        merged_values = merged_values / merged_weights.unsqueeze(1)
         
         # Decode unique keys back to RGB
         merged_keys = torch.zeros(n_unique, 3, dtype=torch.float32, device=self.device)
@@ -76,6 +97,7 @@ class GPUColorMappings:
         
         self.keys_tensor = merged_keys
         self.values_tensor = merged_values
+        self.weights_tensor = merged_weights
     
     def compress_spatial(self, threshold: float = 3.0):
         """
@@ -89,6 +111,10 @@ class GPUColorMappings:
         
         grid_size = int(threshold * 2)
         
+        # Initialize weights if needed
+        if self.weights_tensor is None:
+            self.weights_tensor = torch.ones(len(self.keys_tensor), dtype=torch.float32, device=self.device)
+        
         # Calculate grid indices
         grid_indices = (self.keys_tensor / grid_size).long()
         
@@ -101,21 +127,30 @@ class GPUColorMappings:
         unique_grids, inverse_indices = torch.unique(grid_keys, return_inverse=True)
         n_grids = len(unique_grids)
         
-        # Aggregate colors within each grid
+        # Compress weights
+        compressed_weights = torch.zeros(n_grids, dtype=torch.float32, device=self.device)
+        compressed_weights.scatter_add_(0, inverse_indices, self.weights_tensor)
+        
+        # Aggregate weighted keys and values
         compressed_keys = torch.zeros(n_grids, 3, dtype=torch.float32, device=self.device)
         compressed_values = torch.zeros(n_grids, 3, dtype=torch.float32, device=self.device)
-        counts = torch.bincount(inverse_indices, minlength=n_grids)
         
         indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
-        compressed_keys.scatter_add_(0, indices_expanded, self.keys_tensor)
-        compressed_values.scatter_add_(0, indices_expanded, self.values_tensor)
         
-        # Calculate averages
-        compressed_keys = compressed_keys / counts.unsqueeze(1).float()
-        compressed_values = compressed_values / counts.unsqueeze(1).float()
+        # Weighted accumulation
+        weighted_keys = self.keys_tensor * self.weights_tensor.unsqueeze(1)
+        weighted_values = self.values_tensor * self.weights_tensor.unsqueeze(1)
+        
+        compressed_keys.scatter_add_(0, indices_expanded, weighted_keys)
+        compressed_values.scatter_add_(0, indices_expanded, weighted_values)
+        
+        # Calculate weighted averages
+        compressed_keys = compressed_keys / compressed_weights.unsqueeze(1)
+        compressed_values = compressed_values / compressed_weights.unsqueeze(1)
         
         self.keys_tensor = compressed_keys
         self.values_tensor = compressed_values
+        self.weights_tensor = compressed_weights
     
     def to_dict(self) -> Dict[Tuple[int, int, int], Tuple[int, int, int]]:
         """
@@ -149,6 +184,7 @@ class GPUColorMappings:
         del self.keys_tensor, self.values_tensor
         self.keys_tensor = None
         self.values_tensor = None
+        self.weights_tensor = None
         if 'cuda' in str(self.device):
             torch.cuda.empty_cache()
 
@@ -578,7 +614,7 @@ class LUT3DGeneratorStepwise:
         print("-" * 70)
         compress_start = time.time()
         original_size = gpu_mappings.size()
-        gpu_mappings.compress_spatial(threshold=1.0)
+        gpu_mappings.compress_spatial(threshold=2.0)
         compress_time = time.time() - compress_start
         compression_ratio = (1 - gpu_mappings.size() / original_size) * 100
         print(f"压缩完成: {original_size:,} → {gpu_mappings.size():,} ({compression_ratio:.1f}% 压缩, {compress_time:.2f}秒)\\n")
@@ -597,6 +633,19 @@ class LUT3DGeneratorStepwise:
         
         interp_time = time.time() - interp_start
         print(f"插值完成: {len(grid_tensor):,} 个网格点 ({interp_time:.1f}秒)\\n")
+        
+        # 阶段5: 单调性优化 (GPU)
+        print("阶段5: 单调性优化 (GPU)")
+        print("-" * 70)
+        mono_start = time.time()
+        
+        # Reshape to 3D grid for spatial processing
+        lut_grid = result_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
+        lut_grid = self.enforce_monotonicity_gpu(lut_grid)
+        result_tensor = lut_grid.reshape(-1, 3)
+        
+        mono_time = time.time() - mono_start
+        print(f"单调性优化完成 ({mono_time:.2f}秒)\\n")
         
         # Only now download to CPU
         mapped_colors = result_tensor.cpu().numpy()
@@ -644,7 +693,14 @@ class LUT3DGeneratorStepwise:
         n_mappings = len(keys_lab)
         result_lab = torch.zeros_like(grid_lab)
         
-        k = min(16, n_mappings)
+        # IDW interpolation (GPU)
+        n_grid = len(grid_lab)
+        n_mappings = len(keys_lab)
+        result_lab = torch.zeros_like(grid_lab)
+        
+        # Use more neighbors for smoother result
+        k = min(40, n_mappings)
+        batch_size = 5000
         batch_size = 5000
         
         print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k})")
@@ -660,9 +716,10 @@ class LUT3DGeneratorStepwise:
             # Find k nearest
             topk_dists, topk_indices = torch.topk(distances, k=k, largest=False, dim=1)
             
-            # IDW weights
+            # IDW weights with p=2 (smoother than p=1)
             epsilon = 1e-6
-            weights = 1.0 / (topk_dists + epsilon)
+            # Use squared distance for smoothness
+            weights = 1.0 / (topk_dists.pow(2) + epsilon)
             weights = weights / weights.sum(dim=1, keepdim=True)
             
             # Weighted sum
@@ -681,3 +738,47 @@ class LUT3DGeneratorStepwise:
         result_rgb = self.lab_to_rgb_gpu(result_lab)
         
         return result_rgb
+
+    def enforce_monotonicity_gpu(self, lut_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Enforce monotonicity on the 3D LUT (GPU)
+        
+        Args:
+            lut_grid: (S, S, S, 3) tensor on GPU
+            
+        Returns:
+            (S, S, S, 3) tensor with enforced monotonicity
+        """
+        # LUT grid organization:
+        # lut_grid[b, g, r, c]
+        # Axis 0: Blue input (slowest)
+        # Axis 1: Green input
+        # Axis 2: Red input (fastest)
+        # Channel 0: Red output
+        # Channel 1: Green output
+        # Channel 2: Blue output
+        
+        # We enforce that Output Channel X is monotonic with respect to Input Axis corresponding to X
+        # R_out (ch 0) monotonic along R_in (axis 2)
+        # G_out (ch 1) monotonic along G_in (axis 1)
+        # B_out (ch 2) monotonic along B_in (axis 0)
+        
+        # Clone to avoid in-place modification issues during iteration
+        result = lut_grid.clone()
+        
+        # Simple iterative smoothing that enforces monotonicity
+        # Ensure R[i] >= R[i-1]
+        
+        # 1. Red Channel (0) along Red Axis (2)
+        for r in range(1, result.shape[2]):
+             result[:, :, r, 0] = torch.maximum(result[:, :, r, 0], result[:, :, r-1, 0])
+
+        # 2. Green Channel (1) along Green Axis (1)
+        for g in range(1, result.shape[1]):
+            result[:, g, :, 1] = torch.maximum(result[:, g, :, 1], result[:, g-1, :, 1])
+
+        # 3. Blue Channel (2) along Blue Axis (0)
+        for b in range(1, result.shape[0]):
+            result[b, :, :, 2] = torch.maximum(result[b, :, :, 2], result[b-1, :, :, 2])
+            
+        return result
