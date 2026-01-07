@@ -179,6 +179,221 @@ class GPUColorMappings:
         """Return number of mappings"""
         return 0 if self.keys_tensor is None else len(self.keys_tensor)
     
+    def rgb_to_lab_tensor(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert RGB to LAB color space on GPU (helper for Delta E calculation)
+        
+        Args:
+            rgb_tensor: RGB tensor in range [0, 255], shape (..., 3)
+        
+        Returns:
+            LAB tensor
+        """
+        # Normalize RGB to [0, 1]
+        rgb_normalized = rgb_tensor / 255.0
+        
+        # Convert to linear RGB
+        mask = rgb_normalized > 0.04045
+        rgb_linear = torch.where(
+            mask,
+            torch.pow((rgb_normalized + 0.055) / 1.055, 2.4),
+            rgb_normalized / 12.92
+        )
+        
+        # RGB to XYZ
+        rgb_to_xyz_matrix = torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041]
+        ], dtype=torch.float32, device=self.device)
+        
+        xyz = rgb_linear @ rgb_to_xyz_matrix.T
+        
+        # Normalize by D65 white point
+        d65_white = torch.tensor([0.95047, 1.00000, 1.08883], 
+                                 dtype=torch.float32, device=self.device)
+        xyz_n = xyz / d65_white
+        
+        # XYZ to LAB
+        delta = 6.0 / 29.0
+        mask = xyz_n > delta ** 3
+        f_xyz = torch.where(
+            mask,
+            torch.pow(xyz_n, 1.0 / 3.0),
+            (xyz_n / (3.0 * delta ** 2)) + (4.0 / 29.0)
+        )
+        
+        L = 116.0 * f_xyz[..., 1] - 16.0
+        a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
+        b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+        
+        return torch.stack([L, a, b], dim=-1)
+    
+    def filter_by_delta_e(self, max_delta_e: float = 50.0, percentile_threshold: float = 95.0):
+        """
+        Filter out mappings with excessive color difference (Delta E)
+        This helps remove outliers caused by noise, overexposure, or alignment issues.
+        
+        Args:
+            max_delta_e: Maximum allowed Delta E. Mappings exceeding this are removed.
+                        Typical values:
+                        - 2.3: Just noticeable difference
+                        - 10-20: Normal color grading range
+                        - 30-50: Significant color shift (used for LUT generation)
+                        - >50: Likely outliers/errors
+            percentile_threshold: Only keep mappings with Delta E below this percentile.
+                                 e.g., 95 means remove the top 5% most extreme mappings.
+        """
+        if self.keys_tensor is None or len(self.keys_tensor) == 0:
+            return
+        
+        print(f"    过滤异常映射 (Delta E 阈值: {max_delta_e}, 百分位: {percentile_threshold}%)...")
+        original_size = len(self.keys_tensor)
+        
+        # Convert to LAB for perceptually uniform distance
+        keys_lab = self.rgb_to_lab_tensor(self.keys_tensor)
+        values_lab = self.rgb_to_lab_tensor(self.values_tensor)
+        
+        # Calculate Delta E (CIE76 - simple Euclidean distance in LAB space)
+        delta_e = torch.sqrt(torch.sum((keys_lab - values_lab) ** 2, dim=1))
+        
+        # Create mask for valid mappings
+        # Condition 1: Delta E below max threshold
+        mask_max = delta_e <= max_delta_e
+        
+        # Condition 2: Delta E below percentile threshold
+        percentile_value = torch.quantile(delta_e, percentile_threshold / 100.0)
+        mask_percentile = delta_e <= percentile_value
+        
+        # Combine both conditions
+        valid_mask = mask_max & mask_percentile
+        
+        # Apply filter
+        self.keys_tensor = self.keys_tensor[valid_mask]
+        self.values_tensor = self.values_tensor[valid_mask]
+        if self.weights_tensor is not None:
+            self.weights_tensor = self.weights_tensor[valid_mask]
+        
+        filtered_count = original_size - len(self.keys_tensor)
+        print(f"    剔除异常点: {filtered_count:,} 个 ({filtered_count/original_size*100:.1f}%)")
+        print(f"    Delta E 统计: 中位数={torch.median(delta_e[valid_mask]):.1f}, "
+              f"最大={delta_e[valid_mask].max():.1f}, P95={percentile_value:.1f}")
+
+    def filter_outliers_by_local_consistency(self, grid_size: int = 8, std_threshold: float = 2.5):
+        """
+        Filter outliers based on local color consistency using spatial grid grouping.
+        Uses O(N) memory instead of O(N²) by grouping colors into spatial cells.
+        
+        For each mapping, check if its output color is consistent with other mappings
+        in the same spatial cell of color space.
+        
+        Args:
+            grid_size: Size of grid cells in LAB space for local grouping
+            std_threshold: Remove mappings whose output deviates more than this many 
+                          standard deviations from cell average
+        """
+        if self.keys_tensor is None or len(self.keys_tensor) < 100:
+            return
+        
+        print(f"    局部一致性过滤 (网格={grid_size}, std阈值={std_threshold})...")
+        original_size = len(self.keys_tensor)
+        
+        # Convert to LAB for perceptually uniform analysis
+        keys_lab = self.rgb_to_lab_tensor(self.keys_tensor)
+        values_lab = self.rgb_to_lab_tensor(self.values_tensor)
+        
+        # Quantize LAB to grid cells (memory efficient: O(N))
+        # L is in [0, 100], a and b are approximately in [-128, 127]
+        # Shift a and b to positive range
+        keys_grid = torch.zeros_like(keys_lab, dtype=torch.long)
+        keys_grid[:, 0] = (keys_lab[:, 0] / grid_size).long().clamp(0, 255)  # L
+        keys_grid[:, 1] = ((keys_lab[:, 1] + 128) / grid_size).long().clamp(0, 255)  # a
+        keys_grid[:, 2] = ((keys_lab[:, 2] + 128) / grid_size).long().clamp(0, 255)  # b
+        
+        # Encode grid cell as single integer
+        cell_ids = keys_grid[:, 0] + keys_grid[:, 1] * 256 + keys_grid[:, 2] * 65536
+        
+        # Find unique cells and group mappings
+        unique_cells, inverse_indices = torch.unique(cell_ids, return_inverse=True)
+        n_cells = len(unique_cells)
+        
+        # Calculate per-cell statistics using scatter operations (memory efficient)
+        # Sum of values per cell
+        cell_sum = torch.zeros(n_cells, 3, dtype=torch.float32, device=self.device)
+        cell_sum_sq = torch.zeros(n_cells, 3, dtype=torch.float32, device=self.device)
+        cell_count = torch.zeros(n_cells, dtype=torch.float32, device=self.device)
+        
+        indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
+        cell_sum.scatter_add_(0, indices_expanded, values_lab)
+        cell_sum_sq.scatter_add_(0, indices_expanded, values_lab ** 2)
+        cell_count.scatter_add_(0, inverse_indices, torch.ones(len(values_lab), device=self.device))
+        
+        # Calculate cell mean and std
+        cell_mean = cell_sum / cell_count.unsqueeze(1).clamp(min=1)
+        cell_var = (cell_sum_sq / cell_count.unsqueeze(1).clamp(min=1)) - (cell_mean ** 2)
+        cell_std = torch.sqrt(cell_var.clamp(min=0))
+        
+        # Get statistics for each point's cell
+        point_cell_mean = cell_mean[inverse_indices]  # (N, 3)
+        point_cell_std = cell_std[inverse_indices]  # (N, 3)
+        point_cell_count = cell_count[inverse_indices]  # (N,)
+        
+        # Calculate deviation from cell mean
+        deviation = torch.abs(values_lab - point_cell_mean)
+        
+        # Normalize by std (with minimum to avoid division issues)
+        min_std = 2.0
+        normalized_deviation = deviation / (point_cell_std + min_std)
+        max_deviation = normalized_deviation.max(dim=1).values
+        
+        # Mark as valid if:
+        # 1. Within std threshold, OR
+        # 2. Cell has very few samples (keep them for now)
+        valid_mask = (max_deviation <= std_threshold) | (point_cell_count < 3)
+        
+        # Apply filter
+        self.keys_tensor = self.keys_tensor[valid_mask]
+        self.values_tensor = self.values_tensor[valid_mask]
+        if self.weights_tensor is not None:
+            self.weights_tensor = self.weights_tensor[valid_mask]
+        
+        # Clean up
+        del keys_lab, values_lab, keys_grid, cell_ids, cell_sum, cell_sum_sq
+        if 'cuda' in str(self.device):
+            torch.cuda.empty_cache()
+        
+        filtered_count = original_size - len(self.keys_tensor)
+        print(f"    局部异常点剔除: {filtered_count:,} 个 ({filtered_count/original_size*100:.1f}%)")
+
+    def remove_extreme_colors(self, margin: int = 5):
+        """
+        Remove mappings at extreme edges of color space (near 0 or 255).
+        These often have unreliable mappings due to clipping/saturation.
+        
+        Args:
+            margin: Remove colors within this distance from 0 or 255
+        """
+        if self.keys_tensor is None:
+            return
+        
+        original_size = len(self.keys_tensor)
+        
+        # Find colors too close to extremes
+        too_dark = (self.keys_tensor < margin).any(dim=1)
+        too_bright = (self.keys_tensor > 255 - margin).any(dim=1)
+        extreme_mask = too_dark | too_bright
+        
+        # Keep non-extreme colors
+        valid_mask = ~extreme_mask
+        self.keys_tensor = self.keys_tensor[valid_mask]
+        self.values_tensor = self.values_tensor[valid_mask]
+        if self.weights_tensor is not None:
+            self.weights_tensor = self.weights_tensor[valid_mask]
+        
+        filtered_count = original_size - len(self.keys_tensor)
+        if filtered_count > 0:
+            print(f"    移除极端色彩: {filtered_count:,} 个 ({filtered_count/original_size*100:.1f}%)")
+    
     def clear_memory(self):
         """Release GPU memory"""
         del self.keys_tensor, self.values_tensor
@@ -608,6 +823,30 @@ class LUT3DGeneratorStepwise:
         gpu_mappings.unique_and_merge()
         merge_time = time.time() - merge_start
         print(f"合并完成: {gpu_mappings.size():,} 个唯一映射 ({merge_time:.2f}秒)\\n")
+        
+        # Filter outliers (GPU) - NEW PHASE
+        print("阶段2.5: 异常点过滤 (GPU)")
+        print("-" * 70)
+        filter_start = time.time()
+        original_size_before_filter = gpu_mappings.size()
+        
+        # Step 1: Remove extreme edge colors (near 0 or 255 - often unreliable)
+        gpu_mappings.remove_extreme_colors(margin=3)
+        
+        # Step 2: Filter by Delta E (remove mappings with excessive color difference)
+        # max_delta_e=50 allows significant color grading while removing obvious errors
+        # percentile_threshold=97 removes top 3% most extreme mappings
+        gpu_mappings.filter_by_delta_e(max_delta_e=50.0, percentile_threshold=97.0)
+        
+        # Step 3: Filter by local consistency (remove isolated outliers)
+        # This removes noisy mappings that don't match their neighbors
+        gpu_mappings.filter_outliers_by_local_consistency(grid_size=8, std_threshold=3.0)
+        
+        filter_time = time.time() - filter_start
+        filtered_total = original_size_before_filter - gpu_mappings.size()
+        filter_ratio = (filtered_total / original_size_before_filter) * 100 if original_size_before_filter > 0 else 0
+        print(f"过滤完成: {original_size_before_filter:,} → {gpu_mappings.size():,}")
+        print(f"总剔除: {filtered_total:,} 个异常点 ({filter_ratio:.1f}%, {filter_time:.2f}秒)\\n")
         
         # Compress (GPU)
         print("阶段3: 空间压缩 (GPU)")
