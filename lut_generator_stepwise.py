@@ -874,17 +874,17 @@ class LUT3DGeneratorStepwise:
         print(f"插值完成: {len(grid_tensor):,} 个网格点 ({interp_time:.1f}秒)\\n")
         
         # 阶段5: 单调性优化 (GPU)
-        print("阶段5: 单调性优化 (GPU)")
-        print("-" * 70)
-        mono_start = time.time()
+        # print("阶段5: 单调性优化 (GPU)")
+        # print("-" * 70)
+        # mono_start = time.time()
         
-        # Reshape to 3D grid for spatial processing
-        lut_grid = result_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
-        lut_grid = self.enforce_monotonicity_gpu(lut_grid)
-        result_tensor = lut_grid.reshape(-1, 3)
+        # # Reshape to 3D grid for spatial processing
+        # lut_grid = result_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
+        # lut_grid = self.enforce_monotonicity_gpu(lut_grid)
+        # result_tensor = lut_grid.reshape(-1, 3)
         
-        mono_time = time.time() - mono_start
-        print(f"单调性优化完成 ({mono_time:.2f}秒)\\n")
+        # mono_time = time.time() - mono_start
+        # print(f"单调性优化完成 ({mono_time:.2f}秒)\\n")
         
         # Only now download to CPU
         mapped_colors = result_tensor.cpu().numpy()
