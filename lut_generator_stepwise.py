@@ -789,7 +789,7 @@ class LUT3DGeneratorStepwise:
         
         # Find image pairs
         photoa_files = sorted([os.path.join(photoa_dir, f) for f in os.listdir(photoa_dir)
-                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))])
+                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif'))])
         
         image_pairs = []
         for photoa_path in photoa_files:
