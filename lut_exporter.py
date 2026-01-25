@@ -135,8 +135,8 @@ class LUTExporter:
             - Magic: 'PLUT' (4 bytes)
             - Version: 1 (uint32, little-endian)
             - Size: LUT dimension (uint32, little-endian)
-            - Data Type: 0 for UINT8 RGB (uint32, little-endian)
-            - Payload: Raw RGB data as uint8 values
+            - Data Type: 0 for UINT8 RGB, 1 for UINT16 RGB (uint32, little-endian)
+            - Payload: Raw RGB data
 
         Args:
             filename: 输出文件名
@@ -144,21 +144,21 @@ class LUTExporter:
         print(f"导出PLUT格式LUT到: {filename}")
 
         lut_size = self.lut_generator.lut_size
-        data = []
+        # Use bit_depth from generator if available, default to 8
+        bit_depth = getattr(self.lut_generator, 'bit_depth', 8)
+        max_val = 65535.0 if bit_depth == 16 else 255.0
+        data_type = 1 if bit_depth == 16 else 0
+        
+        print(f"  PLUT模式: {'16位' if data_type == 1 else '8位'}")
 
-        # Convert LUT data from float [0.0, 1.0] to uint8 [0, 255]
-        for b in range(lut_size):
-            for g in range(lut_size):
-                for r in range(lut_size):
-                    color = self.lut_data[b, g, r]
-                    # Convert each RGB component to uint8
-                    for i in range(3):
-                        val = max(0.0, min(1.0, color[i]))  # Clamp to [0, 1]
-                        data.append(int(val * 255.0 + 0.5))  # Round to nearest int
-
-        expected_count = lut_size * lut_size * lut_size * 3
-        if len(data) != expected_count:
-            print(f"警告: 数据长度不匹配. 期望 {expected_count}, 实际 {len(data)}")
+        # Convert LUT data to target bit depth and type
+        # self.lut_data is (lut_size, lut_size, lut_size, 3) in [0.0, 1.0]
+        if data_type == 1:
+            rgb_data = (self.lut_data * 65535.0 + 0.5).clip(0, 65535).astype(np.uint16)
+        else:
+            rgb_data = (self.lut_data * 255.0 + 0.5).clip(0, 255).astype(np.uint8)
+            
+        payload = rgb_data.tobytes()
 
         with open(filename, 'wb') as f:
             # Magic bytes
@@ -167,15 +167,14 @@ class LUTExporter:
             f.write(struct.pack('<I', 1))
             # Size (uint32, little-endian)
             f.write(struct.pack('<I', lut_size))
-            # Data Type: 0 = UINT8 (uint32, little-endian)
-            f.write(struct.pack('<I', 0))
-            # Payload: RGB data as bytes
-            f.write(bytes(data))
+            # Data Type (uint32, little-endian)
+            f.write(struct.pack('<I', data_type))
+            # Payload
+            f.write(payload)
 
         file_size = os.path.getsize(filename)
-        expected_size = 16 + expected_count  # 4 header fields * 4 bytes + data
         print(f"PLUT文件导出完成: {os.path.abspath(filename)}")
-        print(f"  文件大小: {file_size:,} bytes (期望: {expected_size:,} bytes)")
+        print(f"  文件大小: {file_size:,} bytes")
 
 
     def export_image_preview(self, filename: str, size: Tuple[int, int] = (512, 512)):

@@ -17,14 +17,19 @@ class GPUColorMappings:
     Keeps all data on GPU to eliminate CPU-GPU transfers.
     """
     
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', bit_depth=8):
         """
         Initialize GPU color mappings
         
         Args:
             device: GPU device ('cuda' or 'mps')
+            bit_depth: Bit depth of the input images (default: 8)
         """
         self.device = torch.device(device)
+        self.bit_depth = bit_depth
+        self.max_val = (2 ** bit_depth) - 1
+        self.multiplier = 2 ** bit_depth
+        
         self.keys_tensor = None      # (N, 3) RGB input colors on GPU
         self.values_tensor = None    # (N, 3) RGB output colors on GPU
         self.weights_tensor = None   # (N,) Weights/counts for each mapping
@@ -63,9 +68,14 @@ class GPUColorMappings:
             return
         
         # Encode RGB to single integer key for uniqueness
-        encoded = (self.keys_tensor[:, 0].long() + 
-                   self.keys_tensor[:, 1].long() * 256 + 
-                   self.keys_tensor[:, 2].long() * 65536)
+        # Use multipliers based on bit depth to avoid collisions
+        m1 = 1
+        m2 = self.multiplier
+        m3 = self.multiplier * self.multiplier
+        
+        encoded = (self.keys_tensor[:, 0].long() * m1 + 
+                   self.keys_tensor[:, 1].long() * m2 + 
+                   self.keys_tensor[:, 2].long() * m3)
         
         # Initialize weights if needed
         if self.weights_tensor is None:
@@ -90,10 +100,14 @@ class GPUColorMappings:
         merged_values = merged_values / merged_weights.unsqueeze(1)
         
         # Decode unique keys back to RGB
+        m1 = 1
+        m2 = self.multiplier
+        m3 = self.multiplier * self.multiplier
+        
         merged_keys = torch.zeros(n_unique, 3, dtype=torch.float32, device=self.device)
-        merged_keys[:, 0] = unique_encoded % 256
-        merged_keys[:, 1] = (unique_encoded // 256) % 256
-        merged_keys[:, 2] = unique_encoded // 65536
+        merged_keys[:, 0] = unique_encoded % m2
+        merged_keys[:, 1] = (unique_encoded // m2) % m2
+        merged_keys[:, 2] = unique_encoded // m3
         
         self.keys_tensor = merged_keys
         self.values_tensor = merged_values
@@ -119,9 +133,14 @@ class GPUColorMappings:
         grid_indices = (self.keys_tensor / grid_size).long()
         
         # Encode grid position as single key
-        grid_keys = (grid_indices[:, 0] + 
-                     grid_indices[:, 1] * 10000 + 
-                     grid_indices[:, 2] * 100000000)
+        # Use a large enough multiplier to avoid overlap in 16-bit mode
+        m1 = 1
+        m2 = self.multiplier
+        m3 = self.multiplier * self.multiplier
+        
+        grid_keys = (grid_indices[:, 0] * m1 + 
+                     grid_indices[:, 1] * m2 + 
+                     grid_indices[:, 2] * m3)
         
         # Find unique grids
         unique_grids, inverse_indices = torch.unique(grid_keys, return_inverse=True)
@@ -168,8 +187,10 @@ class GPUColorMappings:
         
         # Build dict
         result = {}
+        # Avoid rounding issues for 16-bit by using float-aware key if needed, 
+        # but here we stick to int for dictionary keys as expected.
         for i in range(len(keys_cpu)):
-            key_tuple = tuple(keys_cpu[i].astype(int))
+            key_tuple = tuple(np.round(keys_cpu[i]).astype(int))
             value_tuple = tuple(np.round(values_cpu[i]).astype(int))
             result[key_tuple] = value_tuple
         
@@ -184,13 +205,13 @@ class GPUColorMappings:
         Convert RGB to LAB color space on GPU (helper for Delta E calculation)
         
         Args:
-            rgb_tensor: RGB tensor in range [0, 255], shape (..., 3)
+            rgb_tensor: RGB tensor in range [0, max_val], shape (..., 3)
         
         Returns:
             LAB tensor
         """
         # Normalize RGB to [0, 1]
-        rgb_normalized = rgb_tensor / 255.0
+        rgb_normalized = rgb_tensor / float(self.max_val)
         
         # Convert to linear RGB
         mask = rgb_normalized > 0.04045
@@ -380,7 +401,7 @@ class GPUColorMappings:
         
         # Find colors too close to extremes
         too_dark = (self.keys_tensor < margin).any(dim=1)
-        too_bright = (self.keys_tensor > 255 - margin).any(dim=1)
+        too_bright = (self.keys_tensor > self.max_val - margin).any(dim=1)
         extreme_mask = too_dark | too_bright
         
         # Keep non-extreme colors
@@ -407,16 +428,19 @@ class GPUColorMappings:
 class LUT3DGeneratorStepwise:
     """Stepwise 3D LUT generator - processes images one by one to avoid memory issues"""
 
-    def __init__(self, lut_size: int = 64, device: str = 'auto'):
+    def __init__(self, lut_size: int = 64, device: str = 'auto', bit_depth: int = 8):
         """
         Initialize stepwise 3D LUT generator
 
         Args:
             lut_size: LUT grid size, default 64 (64x64x64)
             device: Device to use ('cpu', 'mps', 'cuda', 'auto')
+            bit_depth: Bit depth of the input images (default: 8)
         """
         self.lut_size = lut_size
         self.lut_data: Optional[np.ndarray] = None
+        self.bit_depth = bit_depth
+        self.max_val = (2 ** bit_depth) - 1
 
         # Determine device
         if device == 'auto':
@@ -460,20 +484,44 @@ class LUT3DGeneratorStepwise:
             img_a = Image.open(photoa_path)
             img_b = Image.open(photob_path)
 
-            if img_a.mode != 'RGB':
-                img_a = img_a.convert('RGB')
-            if img_b.mode != 'RGB':
-                img_b = img_b.convert('RGB')
+            # Check for 16-bit
+            is_16bit_a = '16' in img_a.mode or img_a.mode == 'I'
+            is_16bit_b = '16' in img_b.mode or img_b.mode == 'I'
+            
+            if is_16bit_a:
+                rgb_a = np.array(img_a, dtype=np.uint16)
+            else:
+                if img_a.mode != 'RGB':
+                    img_a = img_a.convert('RGB')
+                rgb_a = np.array(img_a, dtype=np.uint8)
+                
+            if is_16bit_b:
+                rgb_b = np.array(img_b, dtype=np.uint16)
+            else:
+                if img_b.mode != 'RGB':
+                    img_b = img_b.convert('RGB')
+                rgb_b = np.array(img_b, dtype=np.uint8)
 
-            rgb_a = np.array(img_a, dtype=np.uint8)
-            rgb_b = np.array(img_b, dtype=np.uint8)
+            # Scale to match target bit depth
+            # This ensures that even if inputs are 8-bit, they are treated 
+            # as the correct range (e.g., 0-65535) if bit_depth=16 is selected.
+            if self.bit_depth == 16:
+                if not is_16bit_a:
+                    rgb_a = rgb_a.astype(np.uint16) * 257
+                if not is_16bit_b:
+                    rgb_b = rgb_b.astype(np.uint16) * 257
+            elif self.bit_depth == 8:
+                if is_16bit_a:
+                    rgb_a = (rgb_a.astype(np.float32) / 257.0 + 0.5).astype(np.uint8)
+                if is_16bit_b:
+                    rgb_b = (rgb_b.astype(np.float32) / 257.0 + 0.5).astype(np.uint8)
 
             if rgb_a.shape != rgb_b.shape:
-                print(f"  ⚠ 跳过: {filename}")
+                print(f"  ⚠ 跳过 (尺寸不匹配): {filename}")
                 return
 
         except Exception as e:
-            print(f"  ⚠ 失败: {filename}")
+            print(f"  ⚠ 失败: {filename} - {e}")
             return
 
         # Process on GPU
@@ -484,9 +532,13 @@ class LUT3DGeneratorStepwise:
         pixels_b = torch.from_numpy(rgb_b.reshape(-1, 3)).to(device)
 
         # Encode & unique (GPU)
+        # Use multipliers based on bit depth
+        m2 = gpu_mappings.multiplier
+        m3 = m2 * m2
+        
         keys_a = (pixels_a[:, 0].long() + 
-                  pixels_a[:, 1].long() * 256 + 
-                  pixels_a[:, 2].long() * 65536)
+                  pixels_a[:, 1].long() * m2 + 
+                  pixels_a[:, 2].long() * m3)
 
         unique_keys, inverse_indices = torch.unique(keys_a, return_inverse=True)
         counts = torch.bincount(inverse_indices, minlength=len(unique_keys))
@@ -498,9 +550,9 @@ class LUT3DGeneratorStepwise:
 
         # Decode keys (GPU)
         unique_rgb_keys = torch.zeros(len(unique_keys), 3, dtype=torch.float32, device=device)
-        unique_rgb_keys[:, 0] = unique_keys % 256
-        unique_rgb_keys[:, 1] = (unique_keys // 256) % 256
-        unique_rgb_keys[:, 2] = unique_keys // 65536
+        unique_rgb_keys[:, 0] = unique_keys % m2
+        unique_rgb_keys[:, 1] = (unique_keys // m2) % m2
+        unique_rgb_keys[:, 2] = unique_keys // m3
 
         # Add to GPU mappings (NO CPU DOWNLOAD!)
         gpu_mappings.add_batch(unique_rgb_keys, mean_rgb)
@@ -518,13 +570,13 @@ class LUT3DGeneratorStepwise:
         Convert RGB to LAB color space on GPU using PyTorch
         
         Args:
-            rgb_tensor: RGB tensor in range [0, 255], shape (..., 3), on GPU
+            rgb_tensor: RGB tensor in range [0, max_val], shape (..., 3), on GPU
         
         Returns:
             LAB tensor, L in [0, 100], a and b in approximately [-128, 127]
         """
         # Normalize RGB to [0, 1]
-        rgb_normalized = rgb_tensor / 255.0
+        rgb_normalized = rgb_tensor / float(self.max_val)
         
         # Convert to linear RGB (inverse sRGB gamma correction)
         mask = rgb_normalized > 0.04045
@@ -573,7 +625,7 @@ class LUT3DGeneratorStepwise:
             lab_tensor: LAB tensor, L in [0, 100], a and b in approximately [-128, 127]
         
         Returns:
-            RGB tensor in range [0, 255], shape (..., 3)
+            RGB tensor in range [0, max_val], shape (..., 3)
         """
         L, a, b = lab_tensor[..., 0], lab_tensor[..., 1], lab_tensor[..., 2]
         
@@ -618,24 +670,25 @@ class LUT3DGeneratorStepwise:
             12.92 * rgb_linear
         )
         
-        # Convert to [0, 255] range and clip
-        rgb = torch.clamp(rgb_normalized * 255.0, 0, 255)
+        # Convert to [0, max_val] range and clip
+        rgb = torch.clamp(rgb_normalized * float(self.max_val), 0, self.max_val)
         
         return rgb
 
     @staticmethod
-    def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    def rgb_to_lab(rgb: np.ndarray, max_val: float = 255.0) -> np.ndarray:
         """
         Convert RGB to LAB color space for perceptually uniform interpolation
 
         Args:
-            rgb: RGB values in range [0, 255], shape (..., 3)
+            rgb: RGB values in range [0, max_val], shape (..., 3)
+            max_val: Maximum RGB value (e.g., 255.0 for 8-bit, 65535.0 for 16-bit)
 
         Returns:
             LAB values, L in [0, 100], a and b in approximately [-128, 127]
         """
         # Normalize RGB to [0, 1]
-        rgb_normalized = rgb / 255.0
+        rgb_normalized = rgb / max_val
 
         # Convert to linear RGB (inverse sRGB gamma correction)
         mask = rgb_normalized > 0.04045
@@ -676,15 +729,16 @@ class LUT3DGeneratorStepwise:
         return np.stack([L, a, b], axis=-1)
 
     @staticmethod
-    def lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    def lab_to_rgb(lab: np.ndarray, max_val: float = 255.0) -> np.ndarray:
         """
         Convert LAB back to RGB color space
 
         Args:
             lab: LAB values, L in [0, 100], a and b in approximately [-128, 127]
+            max_val: Maximum RGB value (e.g., 255.0 for 8-bit, 65535.0 for 16-bit)
 
         Returns:
-            RGB values in range [0, 255], shape (..., 3)
+            RGB values in range [0, max_val], shape (..., 3)
         """
         L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
 
@@ -727,8 +781,8 @@ class LUT3DGeneratorStepwise:
             12.92 * rgb_linear
         )
 
-        # Convert to [0, 255] range and clip
-        rgb = np.clip(rgb_normalized * 255.0, 0, 255)
+        # Convert to [0, max_val] range and clip
+        rgb = np.clip(rgb_normalized * max_val, 0, max_val)
 
         return rgb
 
@@ -744,10 +798,10 @@ class LUT3DGeneratorStepwise:
         for b in range(self.lut_size):
             for g in range(self.lut_size):
                 for r in range(self.lut_size):
-                    # Convert grid coordinates to 0-255 range
-                    r_val = int(r * 255.0 / (self.lut_size - 1))
-                    g_val = int(g * 255.0 / (self.lut_size - 1))
-                    b_val = int(b * 255.0 / (self.lut_size - 1))
+                    # Convert grid coordinates to 0-max_val range
+                    r_val = r * float(self.max_val) / (self.lut_size - 1)
+                    g_val = g * float(self.max_val) / (self.lut_size - 1)
+                    b_val = b * float(self.max_val) / (self.lut_size - 1)
 
                     grid_points.append([r_val, g_val, b_val])
 
@@ -801,7 +855,7 @@ class LUT3DGeneratorStepwise:
         print(f"找到 {len(image_pairs)} 对图片\\n")
         
         # Create GPU mappings object
-        gpu_mappings = GPUColorMappings(self.device)
+        gpu_mappings = GPUColorMappings(self.device, bit_depth=self.bit_depth)
         
         # Process all images (data stays on GPU)
         print("阶段1: 像素收集 (GPU)")
@@ -830,12 +884,13 @@ class LUT3DGeneratorStepwise:
         filter_start = time.time()
         original_size_before_filter = gpu_mappings.size()
         
-        # Step 1: Remove extreme edge colors (near 0 or 255 - often unreliable)
-        gpu_mappings.remove_extreme_colors(margin=3)
+        # Step 1: Remove extreme edge colors (often unreliable)
+        # Scale margin based on bit depth (3 for 8-bit, ~768 for 16-bit)
+        scaled_margin = int(round(3.0 * (self.max_val / 255.0)))
+        gpu_mappings.remove_extreme_colors(margin=scaled_margin)
         
         # Step 2: Filter by Delta E (remove mappings with excessive color difference)
-        # max_delta_e=50 allows significant color grading while removing obvious errors
-        # percentile_threshold=97 removes top 3% most extreme mappings
+        # Delta E is in LAB space, so no scaling needed
         gpu_mappings.filter_by_delta_e(max_delta_e=50.0, percentile_threshold=97.0)
         
         # Step 3: Filter by local consistency (remove isolated outliers)
@@ -853,10 +908,16 @@ class LUT3DGeneratorStepwise:
         print("-" * 70)
         compress_start = time.time()
         original_size = gpu_mappings.size()
-        gpu_mappings.compress_spatial(threshold=2.0)
+        
+        # Scale threshold by bit depth (2.0 for 8-bit, ~512 for 16-bit)
+        # This prevents 0% compression in 16-bit mode which would cause GPU OOM
+        scaled_threshold = 2.0 * (self.max_val / 255.0)
+        gpu_mappings.compress_spatial(threshold=scaled_threshold)
+        
         compress_time = time.time() - compress_start
-        compression_ratio = (1 - gpu_mappings.size() / original_size) * 100
-        print(f"压缩完成: {original_size:,} → {gpu_mappings.size():,} ({compression_ratio:.1f}% 压缩, {compress_time:.2f}秒)\\n")
+        compression_ratio = (1 - gpu_mappings.size() / original_size) * 100 if original_size > 0 else 0
+        print(f"压缩完成: {original_size:,} → {gpu_mappings.size():,}")
+        print(f"压缩率: {compression_ratio:.1f}% ({compress_time:.2f}秒)\\n")
         
         # Interpolate (GPU)
         print("阶段4: LUT插值 (GPU)")
@@ -896,7 +957,7 @@ class LUT3DGeneratorStepwise:
             torch.cuda.empty_cache()
         
         # Convert to LUT format
-        mapped_colors_norm = mapped_colors / 255.0
+        mapped_colors_norm = mapped_colors / float(self.max_val)
         mapped_colors_norm = np.clip(mapped_colors_norm, 0.0, 1.0)
         lut_data_3d = mapped_colors_norm.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
         
@@ -932,15 +993,10 @@ class LUT3DGeneratorStepwise:
         n_mappings = len(keys_lab)
         result_lab = torch.zeros_like(grid_lab)
         
-        # IDW interpolation (GPU)
-        n_grid = len(grid_lab)
-        n_mappings = len(keys_lab)
-        result_lab = torch.zeros_like(grid_lab)
-        
         # Use more neighbors for smoother result
         k = min(40, n_mappings)
-        batch_size = 5000
-        batch_size = 5000
+        # Reduce batch_size to avoid GPU OOM, especially for 16-bit data processing
+        batch_size = 1000
         
         print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k})")
         

@@ -56,12 +56,29 @@ class ImageColorMapper:
         """
         try:
             image = Image.open(image_path)
-            # Convert to RGB format
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            
+            # Check if it's a 16-bit image
+            # Pillow modes for 16-bit: 'I;16', 'I;16L', 'I;16B', 'I;16S', etc.
+            # For RGB 16-bit, it's often more complex in Pillow.
+            is_16bit = '16' in image.mode or image.mode == 'I'
+            
+            if is_16bit:
+                # For 16-bit, we want to keep the precision
+                # If it's single channel 16-bit, we might need to handle it
+                # If it's RGB 16-bit (supported in some TIFFs), we keep it
+                rgb_data = np.array(image)
+                if rgb_data.dtype == np.uint8:
+                    # If numpy still thinks it's uint8, then Pillow probably didn't load it as 16-bit
+                    # or it's actually 8-bit. 
+                    pass
+                return rgb_data
+            else:
+                # Convert to RGB format (8-bit)
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
 
-            rgb_data = np.array(image)
-            return rgb_data
+                rgb_data = np.array(image)
+                return rgb_data
 
         except Exception as e:
             print(f"Failed to read image {image_path}: {e}")

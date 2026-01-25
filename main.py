@@ -93,6 +93,14 @@ Examples:
         help='Number of threads for parallel image processing (default: 8)'
     )
 
+    parser.add_argument(
+        '--depth',
+        type=int,
+        default=8,
+        choices=[8, 16],
+        help='Input image bit depth (8 or 16, default: 8)'
+    )
+
     return parser.parse_args()
 
 
@@ -161,13 +169,14 @@ def main():
         print(f"  并行线程数: {args.threads}")
         print(f"  导出格式: {args.formats}")
         print(f"  LUT标题: {args.title}")
+        print(f"  位深支持: {args.depth}-bit")
 
         # Step 1: Generate 3D LUT using stepwise processing
         print(f"\n{'='*30} 生成3D LUT {'='*30}")
 
         start_time = time.time()
 
-        generator = LUT3DGeneratorStepwise(lut_size=args.size, device=args.device)
+        generator = LUT3DGeneratorStepwise(lut_size=args.size, device=args.device, bit_depth=args.depth)
         lut_data = generator.generate_3d_lut_stepwise(args.photoa, args.photob, num_threads=args.threads)
 
         generation_time = time.time() - start_time
@@ -182,11 +191,12 @@ def main():
 
         # Create a wrapper for the generator to use with exporter
         class GeneratorWrapper:
-            def __init__(self, lut_data, lut_size):
+            def __init__(self, lut_data, lut_size, bit_depth):
                 self.lut_data = lut_data
                 self.lut_size = lut_size
+                self.bit_depth = bit_depth
 
-        wrapper = GeneratorWrapper(lut_data, generator.lut_size)
+        wrapper = GeneratorWrapper(lut_data, generator.lut_size, generator.bit_depth)
         exporter = LUTExporter(wrapper)
 
         # Ensure output directory exists
