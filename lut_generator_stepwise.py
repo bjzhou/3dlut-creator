@@ -200,53 +200,41 @@ class GPUColorMappings:
         """Return number of mappings"""
         return 0 if self.keys_tensor is None else len(self.keys_tensor)
     
-    def rgb_to_lab_tensor(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
+    def rgb_to_oklab_tensor(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
         """
-        Convert RGB to LAB color space on GPU (helper for Delta E calculation)
+        Convert RGB to Oklab color space on GPU.
+        Oklab is more perceptually uniform than CIELAB and has better hue constancy.
         
         Args:
             rgb_tensor: RGB tensor in range [0, max_val], shape (..., 3)
         
         Returns:
-            LAB tensor
+            Oklab tensor: L in [0, 1], a and b in approx [-0.4, 0.4]
         """
         # Normalize RGB to [0, 1]
-        rgb_normalized = rgb_tensor / float(self.max_val)
+        rgb = rgb_tensor / float(self.max_val)
         
-        # Convert to linear RGB
-        mask = rgb_normalized > 0.04045
+        # Convert to linear RGB (sRGB inverse gamma)
         rgb_linear = torch.where(
-            mask,
-            torch.pow((rgb_normalized + 0.055) / 1.055, 2.4),
-            rgb_normalized / 12.92
+            rgb > 0.04045,
+            torch.pow((rgb + 0.055) / 1.055, 2.4),
+            rgb / 12.92
         )
         
-        # RGB to XYZ
-        rgb_to_xyz_matrix = torch.tensor([
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041]
-        ], dtype=torch.float32, device=self.device)
+        # Linear RGB to LMS
+        l = 0.4122214708 * rgb_linear[..., 0] + 0.5363325363 * rgb_linear[..., 1] + 0.0514459929 * rgb_linear[..., 2]
+        m = 0.2119034982 * rgb_linear[..., 0] + 0.6806995451 * rgb_linear[..., 1] + 0.1073969566 * rgb_linear[..., 2]
+        s = 0.0883024619 * rgb_linear[..., 0] + 0.2817188976 * rgb_linear[..., 1] + 0.6299787005 * rgb_linear[..., 2]
         
-        xyz = rgb_linear @ rgb_to_xyz_matrix.T
+        # Non-linearity
+        l_ = torch.pow(l.clamp(min=0), 1.0/3.0)
+        m_ = torch.pow(m.clamp(min=0), 1.0/3.0)
+        s_ = torch.pow(s.clamp(min=0), 1.0/3.0)
         
-        # Normalize by D65 white point
-        d65_white = torch.tensor([0.95047, 1.00000, 1.08883], 
-                                 dtype=torch.float32, device=self.device)
-        xyz_n = xyz / d65_white
-        
-        # XYZ to LAB
-        delta = 6.0 / 29.0
-        mask = xyz_n > delta ** 3
-        f_xyz = torch.where(
-            mask,
-            torch.pow(xyz_n, 1.0 / 3.0),
-            (xyz_n / (3.0 * delta ** 2)) + (4.0 / 29.0)
-        )
-        
-        L = 116.0 * f_xyz[..., 1] - 16.0
-        a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
-        b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+        # LMS to Oklab
+        L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
         
         return torch.stack([L, a, b], dim=-1)
     
@@ -268,19 +256,23 @@ class GPUColorMappings:
         if self.keys_tensor is None or len(self.keys_tensor) == 0:
             return
         
-        print(f"    过滤异常映射 (Delta E 阈值: {max_delta_e}, 百分位: {percentile_threshold}%)...")
+        # Scale max_delta_e for Oklab (original was 50.0 for LAB, Oklab range is ~1.0)
+        # Delta E in Oklab is much smaller. ~0.5 Oklab distance is a large shift.
+        max_delta_e_ok = max_delta_e / 100.0
+        
+        print(f"    过滤异常映射 (Oklab Delta E 阈值: {max_delta_e_ok:.3f}, 百分位: {percentile_threshold}%)...")
         original_size = len(self.keys_tensor)
         
-        # Convert to LAB for perceptually uniform distance
-        keys_lab = self.rgb_to_lab_tensor(self.keys_tensor)
-        values_lab = self.rgb_to_lab_tensor(self.values_tensor)
+        # Convert to Oklab for perceptually uniform distance
+        keys_ok = self.rgb_to_oklab_tensor(self.keys_tensor)
+        values_ok = self.rgb_to_oklab_tensor(self.values_tensor)
         
-        # Calculate Delta E (CIE76 - simple Euclidean distance in LAB space)
-        delta_e = torch.sqrt(torch.sum((keys_lab - values_lab) ** 2, dim=1))
+        # Calculate Delta E (Euclidean distance in Oklab space)
+        delta_e = torch.sqrt(torch.sum((keys_ok - values_ok) ** 2, dim=1))
         
         # Create mask for valid mappings
         # Condition 1: Delta E below max threshold
-        mask_max = delta_e <= max_delta_e
+        mask_max = delta_e <= max_delta_e_ok
         
         # Condition 2: Delta E below percentile threshold
         percentile_value = torch.quantile(delta_e, percentile_threshold / 100.0)
@@ -309,27 +301,30 @@ class GPUColorMappings:
         in the same spatial cell of color space.
         
         Args:
-            grid_size: Size of grid cells in LAB space for local grouping
+            grid_size: Size of grid cells in Oklab space for local grouping (scaled internally)
             std_threshold: Remove mappings whose output deviates more than this many 
                           standard deviations from cell average
         """
         if self.keys_tensor is None or len(self.keys_tensor) < 100:
             return
         
-        print(f"    局部一致性过滤 (网格={grid_size}, std阈值={std_threshold})...")
+        # Adjust grid_size for Oklab (L: [0,1], a,b: ~[-0.4, 0.4])
+        # A grid size of 8 in LAB (L range 100) is equivalent to 0.08 in Oklab
+        grid_size_ok = grid_size / 100.0
+        
+        print(f"    局部一致性过滤 (Oklab网格={grid_size_ok:.3f}, std阈值={std_threshold})...")
         original_size = len(self.keys_tensor)
         
-        # Convert to LAB for perceptually uniform analysis
-        keys_lab = self.rgb_to_lab_tensor(self.keys_tensor)
-        values_lab = self.rgb_to_lab_tensor(self.values_tensor)
+        # Convert to Oklab for perceptually uniform analysis
+        keys_ok = self.rgb_to_oklab_tensor(self.keys_tensor)
+        values_ok = self.rgb_to_oklab_tensor(self.values_tensor)
         
-        # Quantize LAB to grid cells (memory efficient: O(N))
-        # L is in [0, 100], a and b are approximately in [-128, 127]
-        # Shift a and b to positive range
-        keys_grid = torch.zeros_like(keys_lab, dtype=torch.long)
-        keys_grid[:, 0] = (keys_lab[:, 0] / grid_size).long().clamp(0, 255)  # L
-        keys_grid[:, 1] = ((keys_lab[:, 1] + 128) / grid_size).long().clamp(0, 255)  # a
-        keys_grid[:, 2] = ((keys_lab[:, 2] + 128) / grid_size).long().clamp(0, 255)  # b
+        # Quantize Oklab to grid cells
+        # L in [0, 1], a and b approx in [-0.4, 0.4]
+        keys_grid = torch.zeros_like(keys_ok, dtype=torch.long)
+        keys_grid[:, 0] = (keys_ok[:, 0] / grid_size_ok).long().clamp(0, 255)  # L
+        keys_grid[:, 1] = ((keys_ok[:, 1] + 0.4) / grid_size_ok).long().clamp(0, 255)  # a
+        keys_grid[:, 2] = ((keys_ok[:, 2] + 0.4) / grid_size_ok).long().clamp(0, 255)  # b
         
         # Encode grid cell as single integer
         cell_ids = keys_grid[:, 0] + keys_grid[:, 1] * 256 + keys_grid[:, 2] * 65536
@@ -345,9 +340,9 @@ class GPUColorMappings:
         cell_count = torch.zeros(n_cells, dtype=torch.float32, device=self.device)
         
         indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
-        cell_sum.scatter_add_(0, indices_expanded, values_lab)
-        cell_sum_sq.scatter_add_(0, indices_expanded, values_lab ** 2)
-        cell_count.scatter_add_(0, inverse_indices, torch.ones(len(values_lab), device=self.device))
+        cell_sum.scatter_add_(0, indices_expanded, values_ok)
+        cell_sum_sq.scatter_add_(0, indices_expanded, values_ok ** 2)
+        cell_count.scatter_add_(0, inverse_indices, torch.ones(len(values_ok), device=self.device))
         
         # Calculate cell mean and std
         cell_mean = cell_sum / cell_count.unsqueeze(1).clamp(min=1)
@@ -360,11 +355,12 @@ class GPUColorMappings:
         point_cell_count = cell_count[inverse_indices]  # (N,)
         
         # Calculate deviation from cell mean
-        deviation = torch.abs(values_lab - point_cell_mean)
+        deviation = torch.abs(values_ok - point_cell_mean)
         
         # Normalize by std (with minimum to avoid division issues)
-        min_std = 2.0
-        normalized_deviation = deviation / (point_cell_std + min_std)
+        # Adjust min_std for Oklab range
+        min_std_ok = 0.02 
+        normalized_deviation = deviation / (point_cell_std + min_std_ok)
         max_deviation = normalized_deviation.max(dim=1).values
         
         # Mark as valid if:
@@ -379,7 +375,7 @@ class GPUColorMappings:
             self.weights_tensor = self.weights_tensor[valid_mask]
         
         # Clean up
-        del keys_lab, values_lab, keys_grid, cell_ids, cell_sum, cell_sum_sq
+        del keys_ok, values_ok, keys_grid, cell_ids, cell_sum, cell_sum_sq
         if 'cuda' in str(self.device):
             torch.cuda.empty_cache()
         
@@ -565,226 +561,124 @@ class LUT3DGeneratorStepwise:
         elapsed = time.time() - start_time
         print(f"  ✓ {filename}: {len(unique_rgb_keys):,} colors ({elapsed*1000:.0f}ms)")
 
-    def rgb_to_lab_gpu(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
+    def rgb_to_oklab_gpu(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
         """
-        Convert RGB to LAB color space on GPU using PyTorch
+        Convert RGB to Oklab color space on GPU using PyTorch
         
         Args:
             rgb_tensor: RGB tensor in range [0, max_val], shape (..., 3), on GPU
         
         Returns:
-            LAB tensor, L in [0, 100], a and b in approximately [-128, 127]
+            Oklab tensor: L in [0, 1], a and b in approx [-0.4, 0.4]
         """
         # Normalize RGB to [0, 1]
-        rgb_normalized = rgb_tensor / float(self.max_val)
+        rgb = rgb_tensor / float(self.max_val)
         
-        # Convert to linear RGB (inverse sRGB gamma correction)
-        mask = rgb_normalized > 0.04045
+        # Convert to linear RGB (sRGB inverse gamma)
         rgb_linear = torch.where(
-            mask,
-            torch.pow((rgb_normalized + 0.055) / 1.055, 2.4),
-            rgb_normalized / 12.92
+            rgb > 0.04045,
+            torch.pow((rgb + 0.055) / 1.055, 2.4),
+            rgb / 12.92
         )
         
-        # RGB to XYZ conversion matrix (D65 illuminant)
-        rgb_to_xyz_matrix = torch.tensor([
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041]
-        ], dtype=torch.float32, device=rgb_tensor.device)
+        # Linear RGB to LMS
+        l = 0.4122214708 * rgb_linear[..., 0] + 0.5363325363 * rgb_linear[..., 1] + 0.0514459929 * rgb_linear[..., 2]
+        m = 0.2119034982 * rgb_linear[..., 0] + 0.6806995451 * rgb_linear[..., 1] + 0.1073969566 * rgb_linear[..., 2]
+        s = 0.0883024619 * rgb_linear[..., 0] + 0.2817188976 * rgb_linear[..., 1] + 0.6299787005 * rgb_linear[..., 2]
         
-        # Convert to XYZ
-        xyz = rgb_linear @ rgb_to_xyz_matrix.T
+        # Non-linearity
+        l_ = torch.pow(l.clamp(min=0), 1.0/3.0)
+        m_ = torch.pow(m.clamp(min=0), 1.0/3.0)
+        s_ = torch.pow(s.clamp(min=0), 1.0/3.0)
         
-        # Normalize by D65 white point
-        d65_white = torch.tensor([0.95047, 1.00000, 1.08883], 
-                                 dtype=torch.float32, device=rgb_tensor.device)
-        xyz_n = xyz / d65_white
-        
-        # XYZ to LAB conversion
-        delta = 6.0 / 29.0
-        mask = xyz_n > delta ** 3
-        f_xyz = torch.where(
-            mask,
-            torch.pow(xyz_n, 1.0 / 3.0),
-            (xyz_n / (3.0 * delta ** 2)) + (4.0 / 29.0)
-        )
-        
-        # Calculate LAB values
-        L = 116.0 * f_xyz[..., 1] - 16.0
-        a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
-        b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+        # LMS to Oklab
+        L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
         
         return torch.stack([L, a, b], dim=-1)
 
-    def lab_to_rgb_gpu(self, lab_tensor: torch.Tensor) -> torch.Tensor:
+    def oklab_to_rgb_gpu(self, oklab_tensor: torch.Tensor) -> torch.Tensor:
         """
-        Convert LAB back to RGB color space on GPU using PyTorch
+        Convert Oklab back to RGB color space on GPU using PyTorch
         
         Args:
-            lab_tensor: LAB tensor, L in [0, 100], a and b in approximately [-128, 127]
+            oklab_tensor: Oklab tensor: L in [0, 1], a and b in approx [-0.4, 0.4]
         
         Returns:
             RGB tensor in range [0, max_val], shape (..., 3)
         """
-        L, a, b = lab_tensor[..., 0], lab_tensor[..., 1], lab_tensor[..., 2]
+        L, a, b = oklab_tensor[..., 0], oklab_tensor[..., 1], oklab_tensor[..., 2]
         
-        # LAB to XYZ conversion
-        fy = (L + 16.0) / 116.0
-        fx = a / 500.0 + fy
-        fz = fy - b / 200.0
+        # Oklab to LMS
+        l_ = L + 0.3963377774 * a + 0.2158037573 * b
+        m_ = L - 0.1055613458 * a - 0.0638541728 * b
+        s_ = L - 0.0894841775 * a - 1.2914855480 * b
         
-        delta = 6.0 / 29.0
+        l = l_ ** 3
+        m = m_ ** 3
+        s = s_ ** 3
         
-        # Inverse f function
-        mask_x = fx > delta
-        mask_y = fy > delta
-        mask_z = fz > delta
+        # LMS to Linear RGB
+        r_lin =  4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s
+        g_lin = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
+        b_lin = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
         
-        xyz_normalized = torch.stack([
-            torch.where(mask_x, fx ** 3, 3.0 * delta ** 2 * (fx - 4.0 / 29.0)),
-            torch.where(mask_y, fy ** 3, 3.0 * delta ** 2 * (fy - 4.0 / 29.0)),
-            torch.where(mask_z, fz ** 3, 3.0 * delta ** 2 * (fz - 4.0 / 29.0))
-        ], dim=-1)
+        rgb_linear = torch.stack([r_lin, g_lin, b_lin], dim=-1)
         
-        # Denormalize by D65 white point
-        d65_white = torch.tensor([0.95047, 1.00000, 1.08883],
-                                 dtype=torch.float32, device=lab_tensor.device)
-        xyz = xyz_normalized * d65_white
-        
-        # XYZ to RGB conversion matrix (D65 illuminant)
-        xyz_to_rgb_matrix = torch.tensor([
-            [ 3.2404542, -1.5371385, -0.4985314],
-            [-0.9692660,  1.8760108,  0.0415560],
-            [ 0.0556434, -0.2040259,  1.0572252]
-        ], dtype=torch.float32, device=lab_tensor.device)
-        
-        # Convert to linear RGB
-        rgb_linear = xyz @ xyz_to_rgb_matrix.T
-        
-        # Apply sRGB gamma correction
-        mask = rgb_linear > 0.0031308
-        rgb_normalized = torch.where(
-            mask,
-            1.055 * torch.pow(rgb_linear, 1.0 / 2.4) - 0.055,
+        # Linear RGB to sRGB (gamma)
+        rgb = torch.where(
+            rgb_linear > 0.0031308,
+            1.055 * torch.pow(rgb_linear.clamp(min=0), 1.0 / 2.4) - 0.055,
             12.92 * rgb_linear
         )
         
         # Convert to [0, max_val] range and clip
-        rgb = torch.clamp(rgb_normalized * float(self.max_val), 0, self.max_val)
-        
-        return rgb
+        return torch.clamp(rgb * float(self.max_val), 0, self.max_val)
 
     @staticmethod
-    def rgb_to_lab(rgb: np.ndarray, max_val: float = 255.0) -> np.ndarray:
+    def rgb_to_oklab(rgb: np.ndarray, max_val: float = 255.0) -> np.ndarray:
         """
-        Convert RGB to LAB color space for perceptually uniform interpolation
-
-        Args:
-            rgb: RGB values in range [0, max_val], shape (..., 3)
-            max_val: Maximum RGB value (e.g., 255.0 for 8-bit, 65535.0 for 16-bit)
-
-        Returns:
-            LAB values, L in [0, 100], a and b in approximately [-128, 127]
+        Convert RGB to Oklab color space (NumPy version)
         """
-        # Normalize RGB to [0, 1]
-        rgb_normalized = rgb / max_val
-
-        # Convert to linear RGB (inverse sRGB gamma correction)
-        mask = rgb_normalized > 0.04045
-        rgb_linear = np.where(
-            mask,
-            np.power((rgb_normalized + 0.055) / 1.055, 2.4),
-            rgb_normalized / 12.92
-        )
-
-        # RGB to XYZ conversion matrix (D65 illuminant)
-        # Using sRGB color space
-        rgb_to_xyz_matrix = np.array([
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041]
-        ])
-
-        # Convert to XYZ
-        xyz = rgb_linear @ rgb_to_xyz_matrix.T
-
-        # Normalize by D65 white point
-        xyz_n = xyz / np.array([0.95047, 1.00000, 1.08883])
-
-        # XYZ to LAB conversion
-        delta = 6.0 / 29.0
-        mask = xyz_n > delta ** 3
-        f_xyz = np.where(
-            mask,
-            np.power(xyz_n, 1.0 / 3.0),
-            (xyz_n / (3.0 * delta ** 2)) + (4.0 / 29.0)
-        )
-
-        # Calculate LAB values
-        L = 116.0 * f_xyz[..., 1] - 16.0
-        a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
-        b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
-
+        rgb_norm = rgb / max_val
+        rgb_linear = np.where(rgb_norm > 0.04045, np.power((rgb_norm + 0.055) / 1.055, 2.4), rgb_norm / 12.92)
+        
+        l = 0.4122214708 * rgb_linear[..., 0] + 0.5363325363 * rgb_linear[..., 1] + 0.0514459929 * rgb_linear[..., 2]
+        m = 0.2119034982 * rgb_linear[..., 0] + 0.6806995451 * rgb_linear[..., 1] + 0.1073969566 * rgb_linear[..., 2]
+        s = 0.0883024619 * rgb_linear[..., 0] + 0.2817188976 * rgb_linear[..., 1] + 0.6299787005 * rgb_linear[..., 2]
+        
+        l_ = np.power(np.maximum(0, l), 1.0/3.0)
+        m_ = np.power(np.maximum(0, m), 1.0/3.0)
+        s_ = np.power(np.maximum(0, s), 1.0/3.0)
+        
+        L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+        
         return np.stack([L, a, b], axis=-1)
 
     @staticmethod
-    def lab_to_rgb(lab: np.ndarray, max_val: float = 255.0) -> np.ndarray:
+    def oklab_to_rgb(oklab: np.ndarray, max_val: float = 255.0) -> np.ndarray:
         """
-        Convert LAB back to RGB color space
-
-        Args:
-            lab: LAB values, L in [0, 100], a and b in approximately [-128, 127]
-            max_val: Maximum RGB value (e.g., 255.0 for 8-bit, 65535.0 for 16-bit)
-
-        Returns:
-            RGB values in range [0, max_val], shape (..., 3)
+        Convert Oklab back to RGB color space (NumPy version)
         """
-        L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-
-        # LAB to XYZ conversion
-        fy = (L + 16.0) / 116.0
-        fx = a / 500.0 + fy
-        fz = fy - b / 200.0
-
-        delta = 6.0 / 29.0
-
-        # Inverse f function
-        mask_x = fx > delta
-        mask_y = fy > delta
-        mask_z = fz > delta
-
-        xyz_normalized = np.stack([
-            np.where(mask_x, fx ** 3, 3.0 * delta ** 2 * (fx - 4.0 / 29.0)),
-            np.where(mask_y, fy ** 3, 3.0 * delta ** 2 * (fy - 4.0 / 29.0)),
-            np.where(mask_z, fz ** 3, 3.0 * delta ** 2 * (fz - 4.0 / 29.0))
-        ], axis=-1)
-
-        # Denormalize by D65 white point
-        xyz = xyz_normalized * np.array([0.95047, 1.00000, 1.08883])
-
-        # XYZ to RGB conversion matrix (D65 illuminant)
-        xyz_to_rgb_matrix = np.array([
-            [ 3.2404542, -1.5371385, -0.4985314],
-            [-0.9692660,  1.8760108,  0.0415560],
-            [ 0.0556434, -0.2040259,  1.0572252]
-        ])
-
-        # Convert to linear RGB
-        rgb_linear = xyz @ xyz_to_rgb_matrix.T
-
-        # Apply sRGB gamma correction
-        mask = rgb_linear > 0.0031308
-        rgb_normalized = np.where(
-            mask,
-            1.055 * np.power(rgb_linear, 1.0 / 2.4) - 0.055,
-            12.92 * rgb_linear
-        )
-
-        # Convert to [0, max_val] range and clip
-        rgb = np.clip(rgb_normalized * max_val, 0, max_val)
-
-        return rgb
+        L, a, b = oklab[..., 0], oklab[..., 1], oklab[..., 2]
+        
+        l_ = L + 0.3963377774 * a + 0.2158037573 * b
+        m_ = L - 0.1055613458 * a - 0.0638541728 * b
+        s_ = L - 0.0894841775 * a - 1.2914855480 * b
+        
+        l, m, s = l_**3, m_**3, s_**3
+        
+        r_lin =  4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s
+        g_lin = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
+        b_lin = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+        
+        rgb_linear = np.stack([r_lin, g_lin, b_lin], axis=-1)
+        rgb = np.where(rgb_linear > 0.0031308, 1.055 * np.power(np.maximum(0, rgb_linear), 1.0 / 2.4) - 0.055, 12.92 * rgb_linear)
+        
+        return np.clip(rgb * max_val, 0, max_val)
 
     def generate_lut_grid(self) -> np.ndarray:
         """
@@ -890,7 +784,7 @@ class LUT3DGeneratorStepwise:
         gpu_mappings.remove_extreme_colors(margin=scaled_margin)
         
         # Step 2: Filter by Delta E (remove mappings with excessive color difference)
-        # Delta E is in LAB space, so no scaling needed
+        # Delta E is in Oklab space, internally scaled from LAB threshold
         gpu_mappings.filter_by_delta_e(max_delta_e=50.0, percentile_threshold=97.0)
         
         # Step 3: Filter by local consistency (remove isolated outliers)
@@ -911,7 +805,7 @@ class LUT3DGeneratorStepwise:
         
         # Scale threshold by bit depth (2.0 for 8-bit, ~512 for 16-bit)
         # This prevents 0% compression in 16-bit mode which would cause GPU OOM
-        scaled_threshold = 2.0 * (self.max_val / 255.0)
+        scaled_threshold = 3.0 * (self.max_val / 255.0)
         gpu_mappings.compress_spatial(threshold=scaled_threshold)
         
         compress_time = time.time() - compress_start
@@ -983,15 +877,15 @@ class LUT3DGeneratorStepwise:
         Returns:
             (N, 3) interpolated colors tensor on GPU
         """
-        # Convert to LAB (GPU)
-        grid_lab = self.rgb_to_lab_gpu(grid_tensor)
-        keys_lab = self.rgb_to_lab_gpu(gpu_mappings.keys_tensor)
-        values_lab = self.rgb_to_lab_gpu(gpu_mappings.values_tensor)
+        # Convert to Oklab (GPU)
+        grid_ok = self.rgb_to_oklab_gpu(grid_tensor)
+        keys_ok = self.rgb_to_oklab_gpu(gpu_mappings.keys_tensor)
+        values_ok = self.rgb_to_oklab_gpu(gpu_mappings.values_tensor)
         
         # IDW interpolation (GPU)
-        n_grid = len(grid_lab)
-        n_mappings = len(keys_lab)
-        result_lab = torch.zeros_like(grid_lab)
+        n_grid = len(grid_ok)
+        n_mappings = len(keys_ok)
+        result_ok = torch.zeros_like(grid_ok)
         
         # Use more neighbors for smoother result
         k = min(40, n_mappings)
@@ -1003,10 +897,10 @@ class LUT3DGeneratorStepwise:
         for batch_idx in range((n_grid + batch_size - 1) // batch_size):
             start = batch_idx * batch_size
             end = min(start + batch_size, n_grid)
-            batch_points = grid_lab[start:end]
+            batch_points = grid_ok[start:end]
             
             # Calculate distances (GPU)
-            distances = torch.cdist(batch_points, keys_lab, p=2)
+            distances = torch.cdist(batch_points, keys_ok, p=2)
             
             # Find k nearest
             topk_dists, topk_indices = torch.topk(distances, k=k, largest=False, dim=1)
@@ -1018,19 +912,19 @@ class LUT3DGeneratorStepwise:
             weights = weights / weights.sum(dim=1, keepdim=True)
             
             # Weighted sum
-            batch_neighbors = values_lab[topk_indices]
+            batch_neighbors = values_ok[topk_indices]
             batch_result = (batch_neighbors * weights.unsqueeze(-1)).sum(dim=1)
             
-            result_lab[start:end] = batch_result
+            result_ok[start:end] = batch_result
             
             if (batch_idx + 1) % 5 == 0:
                 progress = (batch_idx + 1) / ((n_grid + batch_size - 1) // batch_size)
-                print(f"    进度: {progress:.1%}", end='\\r')
+                print(f"    进度: {progress:.1%}", end='\r')
         
         print()
         
         # Convert back to RGB (GPU)
-        result_rgb = self.lab_to_rgb_gpu(result_lab)
+        result_rgb = self.oklab_to_rgb_gpu(result_ok)
         
         return result_rgb
 
