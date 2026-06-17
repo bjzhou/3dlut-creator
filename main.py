@@ -107,16 +107,20 @@ Examples:
 def validate_input(photoa_dir: str, photob_dir: str):
     """Validate input directories and files"""
     if not os.path.exists(photoa_dir):
-        raise ValueError(f"photoa directory does not exist: {photoa_dir}")
+        raise ValueError(f"photoa path does not exist: {photoa_dir}")
 
     if not os.path.exists(photob_dir):
-        raise ValueError(f"photob directory does not exist: {photob_dir}")
+        raise ValueError(f"photob path does not exist: {photob_dir}")
+
+    if os.path.isfile(photoa_dir) and os.path.isfile(photob_dir):
+        print(f"Found single file pair: {photoa_dir} and {photob_dir}")
+        return True
 
     if not os.path.isdir(photoa_dir):
-        raise ValueError(f"photoa path is not a directory: {photoa_dir}")
+        raise ValueError(f"photoa path is not a directory or a valid file pair: {photoa_dir}")
 
     if not os.path.isdir(photob_dir):
-        raise ValueError(f"photob path is not a directory: {photob_dir}")
+        raise ValueError(f"photob path is not a directory or a valid file pair: {photob_dir}")
 
     # Check for image files
     image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')
