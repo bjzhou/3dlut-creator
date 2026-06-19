@@ -334,6 +334,32 @@ class GPUColorMappings:
         if 'cuda' in str(self.device):
             torch.cuda.empty_cache()
 
+    def output_is_grayscale(self) -> bool:
+        """
+        Detect monochrome targets from channel spread in output samples.
+
+        A black-and-white target must stay on the neutral RGB axis throughout LUT
+        generation. Otherwise residual interpolation and per-channel monotonic
+        projection can reintroduce color.
+        """
+        if self.values_tensor is None or len(self.values_tensor) == 0:
+            return False
+
+        channel_spread = (
+            self.values_tensor.max(dim=1).values - self.values_tensor.min(dim=1).values
+        ).float()
+        tolerance = max(3.0 * (self.max_val / 255.0), 1.0)
+        p99 = float(torch.quantile(channel_spread, 0.99))
+        mean = float(torch.mean(channel_spread))
+        max_spread = float(torch.max(channel_spread))
+        is_grayscale = p99 <= tolerance and mean <= tolerance
+        status = "黑白/中性" if is_grayscale else "彩色"
+        print(
+            f"    目标色彩检测: {status} "
+            f"(通道差 mean={mean:.3f}, P99={p99:.3f}, max={max_spread:.3f}, tol={tolerance:.3f})"
+        )
+        return is_grayscale
+
     def clear_memory(self):
         """Release GPU memory"""
         del self.keys_tensor, self.values_tensor
@@ -712,6 +738,9 @@ class LUT3DGeneratorStepwise:
         gpu_mappings.unique_and_merge(outlier_rejection=False)
         merge_time = time.time() - merge_start
         print(f"合并完成: {gpu_mappings.size():,} 个唯一映射 ({merge_time:.2f}秒)\\n")
+
+        target_is_grayscale = gpu_mappings.output_is_grayscale()
+        print()
         
         print("阶段2.5: 局部一致性可靠度加权 (GPU)")
         print("-" * 70)
@@ -746,7 +775,11 @@ class LUT3DGeneratorStepwise:
         grid_tensor = torch.from_numpy(grid_points).to(self.device)
         
         # Interpolate using GPU tensors
-        result_tensor = self.interpolate_gpu_tensor(grid_tensor, gpu_mappings)
+        result_tensor = self.interpolate_gpu_tensor(
+            grid_tensor,
+            gpu_mappings,
+            force_monochrome=target_is_grayscale,
+        )
         
         interp_time = time.time() - interp_start
         print(f"插值完成: {len(grid_tensor):,} 个网格点 ({interp_time:.1f}秒)\\n")
@@ -756,7 +789,11 @@ class LUT3DGeneratorStepwise:
         constrain_start = time.time()
         lut_grid = result_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
         identity_grid = grid_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
-        lut_grid = self.constrain_smooth_monotonic_gpu(lut_grid, identity_grid)
+        lut_grid = self.constrain_smooth_monotonic_gpu(
+            lut_grid,
+            identity_grid,
+            force_monochrome=target_is_grayscale,
+        )
         result_tensor = lut_grid.reshape(-1, 3)
 
         constrain_time = time.time() - constrain_start
@@ -786,14 +823,19 @@ class LUT3DGeneratorStepwise:
         self.lut_data = lut_data_3d
         return lut_data_3d
     
-    def interpolate_gpu_tensor(self, grid_tensor: torch.Tensor, 
-                                gpu_mappings: GPUColorMappings) -> torch.Tensor:
+    def interpolate_gpu_tensor(
+        self,
+        grid_tensor: torch.Tensor,
+        gpu_mappings: GPUColorMappings,
+        force_monochrome: bool = False,
+    ) -> torch.Tensor:
         """
         GPU-native interpolation using tensors (no CPU transfer)
         
         Args:
             grid_tensor: (N, 3) grid points on GPU
             gpu_mappings: GPUColorMappings with keys/values on GPU
+            force_monochrome: If True, constrain interpolation to neutral Oklab axis
             
         Returns:
             (N, 3) interpolated colors tensor on GPU
@@ -802,6 +844,9 @@ class LUT3DGeneratorStepwise:
         grid_ok = self.rgb_to_oklab_gpu(grid_tensor)
         keys_ok = self.rgb_to_oklab_gpu(gpu_mappings.keys_tensor)
         values_ok = self.rgb_to_oklab_gpu(gpu_mappings.values_tensor)
+        if force_monochrome:
+            values_ok = values_ok.clone()
+            values_ok[:, 1:] = 0.0
         residuals_ok = values_ok - keys_ok
         
         # IDW interpolation (GPU)
@@ -817,7 +862,8 @@ class LUT3DGeneratorStepwise:
         batch_size = 1000
         
         weight_mode = "样本权重" if mapping_weights is not None else "均匀权重"
-        print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k}, p={power}, 残差位移, {weight_mode})")
+        color_mode = "黑白亮度残差" if force_monochrome else "彩色残差位移"
+        print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k}, p={power}, {color_mode}, {weight_mode})")
         
         for batch_idx in range((n_grid + batch_size - 1) // batch_size):
             start = batch_idx * batch_size
@@ -841,6 +887,8 @@ class LUT3DGeneratorStepwise:
             batch_neighbors = residuals_ok[topk_indices]
             batch_result = (batch_neighbors * weights.unsqueeze(-1)).sum(dim=1)
             batch_result = batch_points + batch_result
+            if force_monochrome:
+                batch_result[:, 1:] = 0.0
             
             result_ok[start:end] = batch_result
             
@@ -852,13 +900,25 @@ class LUT3DGeneratorStepwise:
         
         # Convert back to RGB (GPU)
         result_rgb = self.oklab_to_rgb_gpu(result_ok)
+        if force_monochrome:
+            result_rgb = self.force_monochrome_rgb_gpu(result_rgb)
         
         return result_rgb
+
+    def force_monochrome_rgb_gpu(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
+        """Put RGB values exactly on the neutral axis."""
+        gray = (
+            rgb_tensor[..., 0] * 0.2126
+            + rgb_tensor[..., 1] * 0.7152
+            + rgb_tensor[..., 2] * 0.0722
+        )
+        return gray.unsqueeze(-1).expand_as(rgb_tensor)
 
     def constrain_smooth_monotonic_gpu(
         self,
         lut_grid: torch.Tensor,
         identity_grid: torch.Tensor,
+        force_monochrome: bool = False,
     ) -> torch.Tensor:
         """
         Preserve the learned look while enforcing smooth monotonic LUT behavior.
@@ -869,6 +929,9 @@ class LUT3DGeneratorStepwise:
         4. Blend with the closest monotonic projection; convex combinations of
            monotonic LUTs remain monotonic and pull the result back toward style.
         """
+        if force_monochrome:
+            return self.constrain_monochrome_smooth_monotonic_gpu(lut_grid, identity_grid)
+
         print("    >> 最近单调投影 (PAVA, 不删点)...")
         closest_monotonic = self.enforce_monotonicity_gpu(lut_grid, verbose=True)
         current = closest_monotonic
@@ -887,6 +950,39 @@ class LUT3DGeneratorStepwise:
             current = current * 0.86 + closest_monotonic * 0.14
 
         return torch.clamp(current, 0, self.max_val)
+
+    def constrain_monochrome_smooth_monotonic_gpu(
+        self,
+        lut_grid: torch.Tensor,
+        identity_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Constrain a black-and-white LUT as one scalar gray field."""
+        print("    >> 黑白LUT: 灰阶标量三轴单调投影 (PAVA)...")
+        gray_grid = self.rgb_luma_gpu(lut_grid)
+        identity_gray = self.rgb_luma_gpu(identity_grid)
+        closest_monotonic = self.enforce_scalar_monotonicity_gpu(gray_grid, verbose=True)
+        current = closest_monotonic
+
+        for iteration in range(self.SMOOTH_ITERATIONS):
+            print(f"    >> 黑白LUT: 边缘保留灰阶残差平滑 {iteration + 1}/{self.SMOOTH_ITERATIONS}...")
+            smoothed = self.edge_aware_smooth_scalar_residual_gpu(
+                current,
+                identity_gray,
+                strength=self.SMOOTH_STRENGTH,
+            )
+            current = self.enforce_scalar_monotonicity_gpu(smoothed, verbose=False)
+            current = current * 0.86 + closest_monotonic * 0.14
+
+        current = torch.clamp(current, 0, self.max_val)
+        return current.unsqueeze(-1).expand(*current.shape, 3)
+
+    def rgb_luma_gpu(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
+        """Rec.709 luma used only for neutral-axis constraints."""
+        return (
+            rgb_tensor[..., 0] * 0.2126
+            + rgb_tensor[..., 1] * 0.7152
+            + rgb_tensor[..., 2] * 0.0722
+        )
 
     def edge_aware_smooth_residual_gpu(
         self,
@@ -930,6 +1026,48 @@ class LUT3DGeneratorStepwise:
         residual_smoothed = x.squeeze(0).permute(1, 2, 3, 0)
         return identity_grid + residual_smoothed
 
+    def edge_aware_smooth_scalar_residual_gpu(
+        self,
+        gray_grid: torch.Tensor,
+        identity_gray: torch.Tensor,
+        strength: float,
+    ) -> torch.Tensor:
+        """Edge-aware smoothing for a scalar monochrome LUT."""
+        import torch.nn.functional as F
+
+        residual = gray_grid - identity_gray
+        x = residual.unsqueeze(0).unsqueeze(0)
+        center = x
+        padded = F.pad(x, (1, 1, 1, 1, 1, 1), mode='replicate')
+
+        _, _, depth, height, width = x.shape
+        accum = torch.zeros_like(x)
+        weight_sum = torch.zeros_like(x)
+        sigma_gray = max(float(self.max_val) * 0.07, 1e-3)
+
+        for db in (-1, 0, 1):
+            for dg in (-1, 0, 1):
+                for dr in (-1, 0, 1):
+                    neighbor = padded[
+                        :,
+                        :,
+                        1 + db:1 + db + depth,
+                        1 + dg:1 + dg + height,
+                        1 + dr:1 + dr + width,
+                    ]
+                    spatial_dist_sq = float(db * db + dg * dg + dr * dr)
+                    spatial_weight = float(np.exp(-spatial_dist_sq / 2.0))
+                    residual_dist_sq = (neighbor - center) ** 2
+                    range_weight = torch.exp(-residual_dist_sq / (2.0 * sigma_gray * sigma_gray))
+                    weight = range_weight * spatial_weight
+                    accum = accum + neighbor * weight
+                    weight_sum = weight_sum + weight
+
+        smoothed = accum / weight_sum.clamp(min=1e-6)
+        x = center * (1.0 - strength) + smoothed * strength
+        residual_smoothed = x.squeeze(0).squeeze(0)
+        return identity_gray + residual_smoothed
+
     @staticmethod
     def _pava_non_decreasing(seq: np.ndarray) -> np.ndarray:
         """Closest non-decreasing sequence in unweighted L2 norm."""
@@ -959,6 +1097,57 @@ class LUT3DGeneratorStepwise:
         for level, start, end in zip(levels, starts, ends):
             result[start:end + 1] = level
         return result
+
+    @staticmethod
+    def _max_monotonic_violation_3d(grid_np: np.ndarray) -> float:
+        """Largest downward step along any input axis."""
+        violations = [
+            -np.min(np.diff(grid_np, axis=0)),
+            -np.min(np.diff(grid_np, axis=1)),
+            -np.min(np.diff(grid_np, axis=2)),
+        ]
+        return float(max(0.0, *violations))
+
+    def enforce_scalar_monotonicity_gpu(
+        self,
+        gray_grid: torch.Tensor,
+        verbose: bool = True,
+    ) -> torch.Tensor:
+        """Project a scalar LUT toward monotonicity on all three input axes."""
+        device = gray_grid.device
+        grid_np = gray_grid.detach().cpu().numpy().astype(np.float32, copy=True)
+        original_np = grid_np.copy()
+
+        for _ in range(8):
+            for b in range(grid_np.shape[0]):
+                for g in range(grid_np.shape[1]):
+                    grid_np[b, g, :] = self._pava_non_decreasing(grid_np[b, g, :])
+
+            for b in range(grid_np.shape[0]):
+                for r in range(grid_np.shape[2]):
+                    grid_np[b, :, r] = self._pava_non_decreasing(grid_np[b, :, r])
+
+            for g in range(grid_np.shape[1]):
+                for r in range(grid_np.shape[2]):
+                    grid_np[:, g, r] = self._pava_non_decreasing(grid_np[:, g, r])
+
+            if self._max_monotonic_violation_3d(grid_np) <= 1e-4:
+                break
+
+        remaining_violation = self._max_monotonic_violation_3d(grid_np)
+        if remaining_violation > 1e-4:
+            grid_np = np.maximum.accumulate(grid_np, axis=2)
+            grid_np = np.maximum.accumulate(grid_np, axis=1)
+            grid_np = np.maximum.accumulate(grid_np, axis=0)
+
+        if verbose:
+            correction = np.abs(grid_np - original_np)
+            print(
+                f"    灰阶单调投影修正: 平均={correction.mean():.3f}, "
+                f"P95={np.percentile(correction, 95):.3f}, 最大={correction.max():.3f}"
+            )
+
+        return torch.from_numpy(grid_np).to(device)
 
     def enforce_monotonicity_gpu(self, lut_grid: torch.Tensor, verbose: bool = True) -> torch.Tensor:
         """Project each primary channel axis to the nearest non-decreasing sequence."""
