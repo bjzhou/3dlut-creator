@@ -35,25 +35,35 @@ class GPUColorMappings:
         self.weights_tensor = None   # (N,) Weights/counts for each mapping
 
         
-    def add_batch(self, new_keys: torch.Tensor, new_values: torch.Tensor):
+    def add_batch(
+        self,
+        new_keys: torch.Tensor,
+        new_values: torch.Tensor,
+        new_weights: Optional[torch.Tensor] = None,
+    ):
         """
         Add a batch of mappings (already on GPU)
         
         Args:
             new_keys: (M, 3) tensor of input RGB colors
             new_values: (M, 3) tensor of output RGB colors
+            new_weights: (M,) tensor with sample counts/reliability weights
         """
+        if new_weights is None:
+            new_weights = torch.ones(len(new_keys), dtype=torch.float32, device=self.device)
+        else:
+            new_weights = new_weights.to(device=self.device, dtype=torch.float32)
+
         if self.keys_tensor is None:
             self.keys_tensor = new_keys
             self.values_tensor = new_values
-            self.weights_tensor = torch.ones(len(new_keys), dtype=torch.float32, device=self.device)
+            self.weights_tensor = new_weights
         else:
             # Concatenate tensors (GPU operation, no CPU transfer)
             self.keys_tensor = torch.cat([self.keys_tensor, new_keys], dim=0)
             self.values_tensor = torch.cat([self.values_tensor, new_values], dim=0)
             
             # Handle weights
-            new_weights = torch.ones(len(new_keys), dtype=torch.float32, device=self.device)
             if self.weights_tensor is None:
                 self.weights_tensor = torch.ones(len(self.keys_tensor) - len(new_keys), 
                                                dtype=torch.float32, device=self.device)
@@ -257,179 +267,73 @@ class GPUColorMappings:
         
         return torch.stack([L, a, b], dim=-1)
     
-    def filter_by_delta_e(self, max_delta_e: float = 50.0, percentile_threshold: float = 95.0):
+    def downweight_local_inconsistency(self, grid_size: int = 6, strength: float = 0.7):
         """
-        Filter out mappings with excessive color difference (Delta E)
-        This helps remove outliers caused by noise, overexposure, or alignment issues.
-        
-        Args:
-            max_delta_e: Maximum allowed Delta E. Mappings exceeding this are removed.
-                        Typical values:
-                        - 2.3: Just noticeable difference
-                        - 10-20: Normal color grading range
-                        - 30-50: Significant color shift (used for LUT generation)
-                        - >50: Likely outliers/errors
-            percentile_threshold: Only keep mappings with Delta E below this percentile.
-                                 e.g., 95 means remove the top 5% most extreme mappings.
-        """
-        if self.keys_tensor is None or len(self.keys_tensor) == 0:
-            return
-        
-        # Scale max_delta_e for Oklab (original was 50.0 for LAB, Oklab range is ~1.0)
-        # Delta E in Oklab is much smaller. ~0.5 Oklab distance is a large shift.
-        max_delta_e_ok = max_delta_e / 100.0
-        
-        print(f"    过滤异常映射 (Oklab Delta E 阈值: {max_delta_e_ok:.3f}, 百分位: {percentile_threshold}%)...")
-        original_size = len(self.keys_tensor)
-        
-        # Convert to Oklab for perceptually uniform distance
-        keys_ok = self.rgb_to_oklab_tensor(self.keys_tensor)
-        values_ok = self.rgb_to_oklab_tensor(self.values_tensor)
-        
-        # Calculate Delta E (Euclidean distance in Oklab space)
-        delta_e = torch.sqrt(torch.sum((keys_ok - values_ok) ** 2, dim=1))
-        
-        # Create mask for valid mappings
-        # Condition 1: Delta E below max threshold
-        mask_max = delta_e <= max_delta_e_ok
-        
-        # Condition 2: Delta E below percentile threshold
-        percentile_value = torch.quantile(delta_e, percentile_threshold / 100.0)
-        mask_percentile = delta_e <= percentile_value
-        
-        # Combine both conditions
-        valid_mask = mask_max & mask_percentile
-        
-        # Apply filter
-        self.keys_tensor = self.keys_tensor[valid_mask]
-        self.values_tensor = self.values_tensor[valid_mask]
-        if self.weights_tensor is not None:
-            self.weights_tensor = self.weights_tensor[valid_mask]
-        
-        filtered_count = original_size - len(self.keys_tensor)
-        print(f"    剔除异常点: {filtered_count:,} 个 ({filtered_count/original_size*100:.1f}%)")
-        print(f"    Delta E 统计 (JND近似): 中位数={float(torch.median(delta_e))*100:.3f}, "
-              f"P95={float(percentile_value)*100:.3f}, 最大={float(delta_e.max())*100:.3f}")
+        Reduce the influence of locally inconsistent mappings without deleting them.
 
-    def filter_outliers_by_local_consistency(self, grid_size: int = 8, std_threshold: float = 2.5):
-        """
-        Filter outliers based on local color consistency using spatial grid grouping.
-        Uses O(N) memory instead of O(N²) by grouping colors into spatial cells.
-        
-        For each mapping, check if its output color is consistent with other mappings
-        in the same spatial cell of color space.
-        
-        Args:
-            grid_size: Size of grid cells in Oklab space for local grouping (scaled internally)
-            std_threshold: Remove mappings whose output deviates more than this many 
-                          standard deviations from cell average
+        The score is based on output residuals in Oklab, not input/output distance.
+        Coherent strong looks are preserved because a whole local region can move far
+        from identity and still keep full weight.
         """
         if self.keys_tensor is None or len(self.keys_tensor) < 100:
             return
-        
-        # Adjust grid_size for Oklab (L: [0,1], a,b: ~[-0.4, 0.4])
-        # A grid size of 8 in LAB (L range 100) is equivalent to 0.08 in Oklab
+
+        if self.weights_tensor is None:
+            self.weights_tensor = torch.ones(len(self.keys_tensor), dtype=torch.float32, device=self.device)
+
         grid_size_ok = grid_size / 100.0
-        
-        print(f"    局部一致性过滤 (Oklab网格={grid_size_ok:.3f}, std阈值={std_threshold})...")
-        original_size = len(self.keys_tensor)
-        
-        # Convert to Oklab for perceptually uniform analysis
+        print(f"    局部残差一致性加权 (Oklab网格={grid_size_ok:.3f}, strength={strength})...")
+
         keys_ok = self.rgb_to_oklab_tensor(self.keys_tensor)
         values_ok = self.rgb_to_oklab_tensor(self.values_tensor)
-        
-        # Quantize Oklab to grid cells
-        # L in [0, 1], a and b approx in [-0.4, 0.4]
+        residuals_ok = values_ok - keys_ok
+
         keys_grid = torch.zeros_like(keys_ok, dtype=torch.long)
-        keys_grid[:, 0] = (keys_ok[:, 0] / grid_size_ok).long().clamp(0, 255)  # L
-        keys_grid[:, 1] = ((keys_ok[:, 1] + 0.4) / grid_size_ok).long().clamp(0, 255)  # a
-        keys_grid[:, 2] = ((keys_ok[:, 2] + 0.4) / grid_size_ok).long().clamp(0, 255)  # b
-        
-        # Encode grid cell as single integer
+        keys_grid[:, 0] = (keys_ok[:, 0] / grid_size_ok).long().clamp(0, 255)
+        keys_grid[:, 1] = ((keys_ok[:, 1] + 0.4) / grid_size_ok).long().clamp(0, 255)
+        keys_grid[:, 2] = ((keys_ok[:, 2] + 0.4) / grid_size_ok).long().clamp(0, 255)
         cell_ids = keys_grid[:, 0] + keys_grid[:, 1] * 256 + keys_grid[:, 2] * 65536
-        
-        # Find unique cells and group mappings
+
         unique_cells, inverse_indices = torch.unique(cell_ids, return_inverse=True)
         n_cells = len(unique_cells)
-        
-        # Calculate per-cell statistics using scatter operations (memory efficient)
-        # Sum of values per cell
-        cell_sum = torch.zeros(n_cells, 3, dtype=torch.float32, device=self.device)
-        cell_sum_sq = torch.zeros(n_cells, 3, dtype=torch.float32, device=self.device)
         cell_count = torch.zeros(n_cells, dtype=torch.float32, device=self.device)
-        
+        cell_sum = torch.zeros(n_cells, 3, dtype=torch.float32, device=self.device)
+
         indices_expanded = inverse_indices.unsqueeze(1).expand(-1, 3)
-        cell_sum.scatter_add_(0, indices_expanded, values_ok)
-        cell_sum_sq.scatter_add_(0, indices_expanded, values_ok ** 2)
-        cell_count.scatter_add_(0, inverse_indices, torch.ones(len(values_ok), device=self.device))
-        
-        # Calculate cell mean and std
-        cell_mean = cell_sum / cell_count.unsqueeze(1).clamp(min=1)
-        cell_var = (cell_sum_sq / cell_count.unsqueeze(1).clamp(min=1)) - (cell_mean ** 2)
-        cell_std = torch.sqrt(cell_var.clamp(min=0))
-        
-        # Get statistics for each point's cell
-        point_cell_mean = cell_mean[inverse_indices]  # (N, 3)
-        point_cell_std = cell_std[inverse_indices]  # (N, 3)
-        point_cell_count = cell_count[inverse_indices]  # (N,)
-        
-        # Calculate deviation from cell mean
-        deviation = torch.abs(values_ok - point_cell_mean)
-        
-        # Normalize by std (with minimum to avoid division issues)
-        # Adjust min_std for Oklab range. Lowered to 0.005 to be more sensitive to outliers.
-        min_std_ok = 0.005 
-        normalized_deviation = deviation / (point_cell_std + min_std_ok)
-        max_deviation = normalized_deviation.max(dim=1).values
-        
-        # Mark as valid if:
-        # 1. Within std threshold, OR
-        # 2. Cell has very few samples (keep them for now)
-        valid_mask = (max_deviation <= std_threshold) | (point_cell_count < 3)
-        
-        # Apply filter
-        self.keys_tensor = self.keys_tensor[valid_mask]
-        self.values_tensor = self.values_tensor[valid_mask]
-        if self.weights_tensor is not None:
-            self.weights_tensor = self.weights_tensor[valid_mask]
-        
-        # Clean up
-        del keys_ok, values_ok, keys_grid, cell_ids, cell_sum, cell_sum_sq
+        cell_count.scatter_add_(0, inverse_indices, torch.ones(len(residuals_ok), device=self.device))
+        cell_sum.scatter_add_(0, indices_expanded, residuals_ok)
+        cell_mean = cell_sum / cell_count.unsqueeze(1).clamp(min=1.0)
+
+        point_mean = cell_mean[inverse_indices]
+        residual_distance = torch.sqrt(torch.sum((residuals_ok - point_mean) ** 2, dim=1))
+
+        cell_dist_sq_sum = torch.zeros(n_cells, dtype=torch.float32, device=self.device)
+        cell_dist_sq_sum.scatter_add_(0, inverse_indices, residual_distance ** 2)
+        cell_rms = torch.sqrt(cell_dist_sq_sum / cell_count.clamp(min=1.0))
+        point_scale = cell_rms[inverse_indices].clamp(min=0.012)
+        point_count = cell_count[inverse_indices]
+
+        normalized = residual_distance / (point_scale * 3.0)
+        robust_weight = 1.0 / (1.0 + normalized.pow(4))
+        robust_weight = torch.where(
+            point_count < 4,
+            torch.ones_like(robust_weight),
+            robust_weight.clamp(min=0.18),
+        )
+
+        old_weights = self.weights_tensor
+        self.weights_tensor = old_weights * ((1.0 - strength) + strength * robust_weight)
+
+        changed = torch.mean(torch.abs(self.weights_tensor - old_weights) / old_weights.clamp(min=1.0))
+        print(
+            f"    权重调整: 平均变化={float(changed) * 100:.2f}%, "
+            f"最低保留权重={float(robust_weight.min()) * 100:.1f}%"
+        )
+
+        del keys_ok, values_ok, residuals_ok, keys_grid, cell_ids, cell_sum
         if 'cuda' in str(self.device):
             torch.cuda.empty_cache()
-        
-        filtered_count = original_size - len(self.keys_tensor)
-        print(f"    局部异常点剔除: {filtered_count:,} 个 ({filtered_count/original_size*100:.1f}%)")
 
-    def remove_extreme_colors(self, margin: int = 5):
-        """
-        Remove mappings at extreme edges of color space (near 0 or 255).
-        These often have unreliable mappings due to clipping/saturation.
-        
-        Args:
-            margin: Remove colors within this distance from 0 or 255
-        """
-        if self.keys_tensor is None:
-            return
-        
-        original_size = len(self.keys_tensor)
-        
-        # Find colors too close to extremes
-        too_dark = (self.keys_tensor < margin).any(dim=1)
-        too_bright = (self.keys_tensor > self.max_val - margin).any(dim=1)
-        extreme_mask = too_dark | too_bright
-        
-        # Keep non-extreme colors
-        valid_mask = ~extreme_mask
-        self.keys_tensor = self.keys_tensor[valid_mask]
-        self.values_tensor = self.values_tensor[valid_mask]
-        if self.weights_tensor is not None:
-            self.weights_tensor = self.weights_tensor[valid_mask]
-        
-        filtered_count = original_size - len(self.keys_tensor)
-        if filtered_count > 0:
-            print(f"    移除极端色彩: {filtered_count:,} 个 ({filtered_count/original_size*100:.1f}%)")
-    
     def clear_memory(self):
         """Release GPU memory"""
         del self.keys_tensor, self.values_tensor
@@ -443,7 +347,17 @@ class GPUColorMappings:
 class LUT3DGeneratorStepwise:
     """Stepwise 3D LUT generator - processes images one by one to avoid memory issues"""
 
-    def __init__(self, lut_size: int = 64, device: str = 'auto', bit_depth: int = 8):
+    INTERPOLATION_NEIGHBORS = 28
+    INTERPOLATION_POWER = 2.4
+    SMOOTH_ITERATIONS = 2
+    SMOOTH_STRENGTH = 0.28
+
+    def __init__(
+        self,
+        lut_size: int = 64,
+        device: str = 'auto',
+        bit_depth: int = 8,
+    ):
         """
         Initialize stepwise 3D LUT generator
 
@@ -570,7 +484,7 @@ class LUT3DGeneratorStepwise:
         unique_rgb_keys[:, 2] = unique_keys // m3
 
         # Add to GPU mappings (NO CPU DOWNLOAD!)
-        gpu_mappings.add_batch(unique_rgb_keys, mean_rgb)
+        gpu_mappings.add_batch(unique_rgb_keys, mean_rgb, counts.float())
 
         # Clean up
         del pixels_a, pixels_b, keys_a, unique_keys, inverse_indices, sum_rgb
@@ -768,6 +682,9 @@ class LUT3DGeneratorStepwise:
                 if os.path.exists(photob_path):
                     image_pairs.append((photoa_path, photob_path))
         
+        if not image_pairs:
+            raise ValueError("No matching image pairs found")
+
         print(f"找到 {len(image_pairs)} 对图片\n")
         
         # Create GPU mappings object
@@ -785,52 +702,35 @@ class LUT3DGeneratorStepwise:
         collection_time = time.time() - collection_start
         print(f"\\n像素收集完成: {collection_time:.1f}秒 ({collection_time/len(image_pairs):.2f}秒/张)")
         print(f"总映射数: {gpu_mappings.size():,}\\n")
-        
+        if gpu_mappings.size() == 0:
+            raise ValueError("No valid color mappings collected from image pairs")
+
         # Merge duplicates (GPU)
         print("阶段2: 合并重复 (GPU)")
         print("-" * 70)
         merge_start = time.time()
-        gpu_mappings.unique_and_merge()
+        gpu_mappings.unique_and_merge(outlier_rejection=False)
         merge_time = time.time() - merge_start
         print(f"合并完成: {gpu_mappings.size():,} 个唯一映射 ({merge_time:.2f}秒)\\n")
         
-        # Filter outliers (GPU) - NEW PHASE
-        print("阶段2.5: 异常点过滤 (GPU)")
+        print("阶段2.5: 局部一致性可靠度加权 (GPU)")
         print("-" * 70)
-        filter_start = time.time()
-        original_size_before_filter = gpu_mappings.size()
-        
-        # Step 1: Remove extreme edge colors (often unreliable)
-        # Scale margin based on bit depth (3 for 8-bit, ~768 for 16-bit)
-        scaled_margin = int(round(5.0 * (self.max_val / 255.0)))
-        gpu_mappings.remove_extreme_colors(margin=scaled_margin)
-        
-        # Step 2: Filter by Delta E (remove mappings with excessive color difference)
-        # Delta E is in Oklab space, internally scaled from LAB threshold
-        # Using tight threshold (30.0) but high percentile (98.0) to remove obvious errors
-        gpu_mappings.filter_by_delta_e(max_delta_e=30.0, percentile_threshold=95.0)
-        
-        # Step 3: Filter by local consistency (remove isolated outliers)
-        # Tighter settings to ensure outliers don't pull the interpolation
-        gpu_mappings.filter_outliers_by_local_consistency(grid_size=12, std_threshold=2.5)
-        
-        filter_time = time.time() - filter_start
-        filtered_total = original_size_before_filter - gpu_mappings.size()
-        filter_ratio = (filtered_total / original_size_before_filter) * 100 if original_size_before_filter > 0 else 0
-        print(f"过滤完成: {original_size_before_filter:,} → {gpu_mappings.size():,}")
-        print(f"总剔除: {filtered_total:,} 个异常点 ({filter_ratio:.1f}%, {filter_time:.2f}秒)\\n")
-        
-        # Compress (GPU)
-        print("阶段3: 空间压缩 (GPU)")
+        weight_start = time.time()
+        gpu_mappings.downweight_local_inconsistency(grid_size=6, strength=0.7)
+        weight_time = time.time() - weight_start
+        print(f"可靠度加权完成: {gpu_mappings.size():,} 个映射 ({weight_time:.2f}秒)\\n")
+
+        print("阶段3: LUT尺度空间压缩 (GPU)")
         print("-" * 70)
         compress_start = time.time()
         original_size = gpu_mappings.size()
-        
-        # Scale threshold by bit depth (2.0 for 8-bit, ~512 for 16-bit)
-        # Reduced from 3.0 to 2.0 to ensure data resolution matches or exceeds LUT resolution
-        scaled_threshold = 2.0 * (self.max_val / 255.0)
+
+        # Match compression cell width to the final LUT grid spacing. This removes
+        # redundant samples without averaging across visible LUT cells.
+        grid_step = float(self.max_val) / max(self.lut_size - 1, 1)
+        scaled_threshold = max(grid_step / 2.0, 0.5)
         gpu_mappings.compress_spatial(threshold=scaled_threshold)
-        
+
         compress_time = time.time() - compress_start
         compression_ratio = (1 - gpu_mappings.size() / original_size) * 100 if original_size > 0 else 0
         print(f"压缩完成: {original_size:,} → {gpu_mappings.size():,}")
@@ -851,32 +751,16 @@ class LUT3DGeneratorStepwise:
         interp_time = time.time() - interp_start
         print(f"插值完成: {len(grid_tensor):,} 个网格点 ({interp_time:.1f}秒)\\n")
         
-        # 阶段4.5: LUT平滑 (GPU-Native)
-        print("阶段4.5: LUT平滑 (GPU)")
+        print("阶段4.5: 保风格平滑 + 最小改动单调投影")
         print("-" * 70)
-        smooth_start = time.time()
-        
-        # Reshape to 3D grid: (B, G, R, 3)
-        lut_3d = result_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
-        # Perform 3D smoothing
-        lut_3d_smoothed = self.smooth_lut_gpu(lut_3d, iterations=2)
-        result_tensor = lut_3d_smoothed.reshape(-1, 3)
-        
-        smooth_time = time.time() - smooth_start
-        print(f"平滑处理完成 ({smooth_time:.2f}秒)\n")
-        
-        # 阶段5: 单调性优化 (LNDS 剔除异常点)
-        print("阶段5: 强制单调性平滑 (直接移除异常点)")
-        print("-" * 70)
-        mono_start = time.time()
-        
-        # Reshape to 3D grid for spatial processing
+        constrain_start = time.time()
         lut_grid = result_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
-        lut_grid = self.enforce_monotonicity_gpu(lut_grid)
+        identity_grid = grid_tensor.reshape(self.lut_size, self.lut_size, self.lut_size, 3)
+        lut_grid = self.constrain_smooth_monotonic_gpu(lut_grid, identity_grid)
         result_tensor = lut_grid.reshape(-1, 3)
-        
-        mono_time = time.time() - mono_start
-        print(f"单调性平滑完成 ({mono_time:.2f}秒)\n")
+
+        constrain_time = time.time() - constrain_start
+        print(f"约束平滑完成 ({constrain_time:.2f}秒)\n")
         
         # Only now download to CPU
         mapped_colors = result_tensor.cpu().numpy()
@@ -918,18 +802,22 @@ class LUT3DGeneratorStepwise:
         grid_ok = self.rgb_to_oklab_gpu(grid_tensor)
         keys_ok = self.rgb_to_oklab_gpu(gpu_mappings.keys_tensor)
         values_ok = self.rgb_to_oklab_gpu(gpu_mappings.values_tensor)
+        residuals_ok = values_ok - keys_ok
         
         # IDW interpolation (GPU)
         n_grid = len(grid_ok)
         n_mappings = len(keys_ok)
         result_ok = torch.zeros_like(grid_ok)
         
-        # Use more neighbors for smoother result
-        k = min(40, n_mappings)
+        k = min(self.INTERPOLATION_NEIGHBORS, n_mappings)
+        power = self.INTERPOLATION_POWER
+        mapping_weights = gpu_mappings.weights_tensor
+
         # Reduce batch_size to avoid GPU OOM, especially for 16-bit data processing
         batch_size = 1000
         
-        print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k})")
+        weight_mode = "样本权重" if mapping_weights is not None else "均匀权重"
+        print(f"  GPU插值: {n_grid:,} 点 × {n_mappings:,} 映射 (k={k}, p={power}, 残差位移, {weight_mode})")
         
         for batch_idx in range((n_grid + batch_size - 1) // batch_size):
             start = batch_idx * batch_size
@@ -942,15 +830,17 @@ class LUT3DGeneratorStepwise:
             # Find k nearest
             topk_dists, topk_indices = torch.topk(distances, k=k, largest=False, dim=1)
             
-            # IDW weights with p=2 (smoother than p=1)
             epsilon = 1e-6
-            # Use squared distance for smoothness
-            weights = 1.0 / (topk_dists.pow(2) + epsilon)
+            weights = 1.0 / (topk_dists.pow(power) + epsilon)
+            if mapping_weights is not None:
+                reliability = torch.sqrt(mapping_weights[topk_indices].clamp(min=1.0))
+                weights = weights * reliability
             weights = weights / weights.sum(dim=1, keepdim=True)
             
             # Weighted sum
-            batch_neighbors = values_ok[topk_indices]
+            batch_neighbors = residuals_ok[topk_indices]
             batch_result = (batch_neighbors * weights.unsqueeze(-1)).sum(dim=1)
+            batch_result = batch_points + batch_result
             
             result_ok[start:end] = batch_result
             
@@ -965,85 +855,134 @@ class LUT3DGeneratorStepwise:
         
         return result_rgb
 
-    def smooth_lut_gpu(self, lut_grid: torch.Tensor, iterations: int = 1) -> torch.Tensor:
+    def constrain_smooth_monotonic_gpu(
+        self,
+        lut_grid: torch.Tensor,
+        identity_grid: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Smooth the 3D LUT grid using 3D average pooling (box blur) on GPU.
-        
-        Args:
-            lut_grid: (B, G, R, 3) tensor on GPU
-            iterations: Number of smoothing passes
-            
-        Returns:
-            Smoothed (B, G, R, 3) tensor
+        Preserve the learned look while enforcing smooth monotonic LUT behavior.
+
+        1. Project the raw LUT to the monotonic cone with minimal L2 change.
+        2. Smooth only the learned residual, using edge-aware weights.
+        3. Project again so the final result is still monotonic.
+        4. Blend with the closest monotonic projection; convex combinations of
+           monotonic LUTs remain monotonic and pull the result back toward style.
         """
+        print("    >> 最近单调投影 (PAVA, 不删点)...")
+        closest_monotonic = self.enforce_monotonicity_gpu(lut_grid, verbose=True)
+        current = closest_monotonic
+
+        for iteration in range(self.SMOOTH_ITERATIONS):
+            print(f"    >> 边缘保留残差平滑 {iteration + 1}/{self.SMOOTH_ITERATIONS}...")
+            smoothed = self.edge_aware_smooth_residual_gpu(
+                current,
+                identity_grid,
+                strength=self.SMOOTH_STRENGTH,
+            )
+            current = self.enforce_monotonicity_gpu(smoothed, verbose=False)
+
+            # Pull a little toward the nearest monotonic LUT to avoid over-smoothing
+            # hue/style bends that were already valid after projection.
+            current = current * 0.86 + closest_monotonic * 0.14
+
+        return torch.clamp(current, 0, self.max_val)
+
+    def edge_aware_smooth_residual_gpu(
+        self,
+        lut_grid: torch.Tensor,
+        identity_grid: torch.Tensor,
+        strength: float,
+    ) -> torch.Tensor:
+        """Smooth the LUT residual without blurring across strong style changes."""
         import torch.nn.functional as F
-        
-        # Reshape to (C, D, H, W) for conv-like operations
-        # Move channel to second dimension: (1, 3, B, G, R)
-        x = lut_grid.permute(3, 0, 1, 2).unsqueeze(0)
-        
-        for _ in range(iterations):
-            # Use a 3x3x3 box blur via average pooling
-            # Padding='same' behavior via manual padding
-            x = F.avg_pool3d(F.pad(x, (1, 1, 1, 1, 1, 1), mode='replicate'), 
-                             kernel_size=3, stride=1)
-            
-        # Reshape back to (B, G, R, 3)
-        return x.squeeze(0).permute(1, 2, 3, 0)
 
-    def enforce_monotonicity_gpu(self, lut_grid: torch.Tensor) -> torch.Tensor:
-        """
-        Enforce monotonicity by directly removing points that break the monotonic trend
-        and replacing them with linear interpolation, strictly avoiding simple averaging.
-        """
+        residual = lut_grid - identity_grid
+        x = residual.permute(3, 0, 1, 2).unsqueeze(0)
+        center = x
+        padded = F.pad(x, (1, 1, 1, 1, 1, 1), mode='replicate')
+
+        _, _, depth, height, width = x.shape
+        accum = torch.zeros_like(x)
+        weight_sum = torch.zeros((1, 1, depth, height, width), dtype=x.dtype, device=x.device)
+        sigma_color = max(float(self.max_val) * 0.07, 1e-3)
+
+        for db in (-1, 0, 1):
+            for dg in (-1, 0, 1):
+                for dr in (-1, 0, 1):
+                    neighbor = padded[
+                        :,
+                        :,
+                        1 + db:1 + db + depth,
+                        1 + dg:1 + dg + height,
+                        1 + dr:1 + dr + width,
+                    ]
+                    spatial_dist_sq = float(db * db + dg * dg + dr * dr)
+                    spatial_weight = float(np.exp(-spatial_dist_sq / 2.0))
+                    residual_dist_sq = torch.sum((neighbor - center) ** 2, dim=1, keepdim=True)
+                    range_weight = torch.exp(-residual_dist_sq / (2.0 * sigma_color * sigma_color))
+                    weight = range_weight * spatial_weight
+                    accum = accum + neighbor * weight
+                    weight_sum = weight_sum + weight
+
+        smoothed = accum / weight_sum.clamp(min=1e-6)
+        x = center * (1.0 - strength) + smoothed * strength
+        residual_smoothed = x.squeeze(0).permute(1, 2, 3, 0)
+        return identity_grid + residual_smoothed
+
+    @staticmethod
+    def _pava_non_decreasing(seq: np.ndarray) -> np.ndarray:
+        """Closest non-decreasing sequence in unweighted L2 norm."""
+        levels = []
+        weights = []
+        starts = []
+        ends = []
+
+        for idx, value in enumerate(seq.astype(np.float64, copy=False)):
+            levels.append(float(value))
+            weights.append(1.0)
+            starts.append(idx)
+            ends.append(idx)
+
+            while len(levels) >= 2 and levels[-2] > levels[-1]:
+                merged_weight = weights[-2] + weights[-1]
+                merged_level = (levels[-2] * weights[-2] + levels[-1] * weights[-1]) / merged_weight
+                levels[-2] = merged_level
+                weights[-2] = merged_weight
+                ends[-2] = ends[-1]
+                levels.pop()
+                weights.pop()
+                starts.pop()
+                ends.pop()
+
+        result = np.empty_like(seq, dtype=np.float32)
+        for level, start, end in zip(levels, starts, ends):
+            result[start:end + 1] = level
+        return result
+
+    def enforce_monotonicity_gpu(self, lut_grid: torch.Tensor, verbose: bool = True) -> torch.Tensor:
+        """Project each primary channel axis to the nearest non-decreasing sequence."""
         device = lut_grid.device
-        grid_np = lut_grid.cpu().numpy()
+        grid_np = lut_grid.detach().cpu().numpy()
+        original_np = grid_np.copy()
 
-        print("    >> 执行 1D 单调性异常点剔除约束 (直接移除下降点)...")
-        def process_1d(seq):
-            seq_new = seq.copy()
-            # Iteratively find decreasing pairs and remove them to bridge gaps
-            for _ in range(15):
-                to_remove = set()
-                for i in range(1, len(seq_new)):
-                    if seq_new[i] < seq_new[i-1]:
-                        # Break found! Mark both the high and low points for removal
-                        to_remove.add(i-1)
-                        to_remove.add(i)
-                
-                if not to_remove:
-                    break
-                    
-                to_remove = list(to_remove)
-                valid_mask = np.ones(len(seq_new), dtype=bool)
-                valid_mask[to_remove] = False
-                valid_idx = np.where(valid_mask)[0]
-                
-                if len(valid_idx) < 2:
-                    break
-                    
-                # Interpolate the removed points to create a smooth monotonic bridge
-                seq_new = np.interp(np.arange(len(seq_new)), valid_idx, seq_new[valid_idx])
-                
-            # Absolute fallback to guarantee strict monotonicity
-            for i in range(1, len(seq_new)):
-                seq_new[i] = max(seq_new[i], seq_new[i-1])
-            return seq_new
-
-        # Apply monotonic dropping to each color axis
-        # 1. Red Channel (0) along Red Axis (2)
         for b in range(grid_np.shape[0]):
             for g in range(grid_np.shape[1]):
-                grid_np[b, g, :, 0] = process_1d(grid_np[b, g, :, 0])
+                grid_np[b, g, :, 0] = self._pava_non_decreasing(grid_np[b, g, :, 0])
 
-        # 2. Green Channel (1) along Green Axis (1)
         for b in range(grid_np.shape[0]):
             for r in range(grid_np.shape[2]):
-                grid_np[b, :, r, 1] = process_1d(grid_np[b, :, r, 1])
+                grid_np[b, :, r, 1] = self._pava_non_decreasing(grid_np[b, :, r, 1])
 
-        # 3. Blue Channel (2) along Blue Axis (0)
         for g in range(grid_np.shape[1]):
             for r in range(grid_np.shape[2]):
-                grid_np[:, g, r, 2] = process_1d(grid_np[:, g, r, 2])
-                
+                grid_np[:, g, r, 2] = self._pava_non_decreasing(grid_np[:, g, r, 2])
+
+        if verbose:
+            correction = np.abs(grid_np - original_np)
+            print(
+                f"    单调投影修正: 平均={correction.mean():.3f}, "
+                f"P95={np.percentile(correction, 95):.3f}, 最大={correction.max():.3f}"
+            )
+
         return torch.from_numpy(grid_np).to(device)

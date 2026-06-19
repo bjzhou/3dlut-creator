@@ -180,7 +180,11 @@ def main():
 
         start_time = time.time()
 
-        generator = LUT3DGeneratorStepwise(lut_size=args.size, device=args.device, bit_depth=args.depth)
+        generator = LUT3DGeneratorStepwise(
+            lut_size=args.size,
+            device=args.device,
+            bit_depth=args.depth,
+        )
         lut_data = generator.generate_3d_lut_stepwise(args.photoa, args.photob, num_threads=args.threads)
 
         generation_time = time.time() - start_time
