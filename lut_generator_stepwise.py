@@ -1,10 +1,13 @@
-import numpy as np
-from typing import Tuple, Dict, List, Optional
-from image_processor import ImageColorMapper
+import heapq
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-import os
+from typing import Tuple, Dict, List, Optional
+
+import numpy as np
+
+from image_processor import ImageColorMapper
 
 
 import torch
@@ -923,18 +926,18 @@ class LUT3DGeneratorStepwise:
         """
         Preserve the learned look while enforcing smooth monotonic LUT behavior.
 
-        1. Project the raw LUT to the monotonic cone with minimal L2 change.
+        1. Fit the raw LUT with L1 isotonic regression.
         2. Smooth only the learned residual, using edge-aware weights.
-        3. Project again so the final result is still monotonic.
-        4. Blend with the closest monotonic projection; convex combinations of
+        3. Fit again so the final result is still monotonic.
+        4. Blend with the initial L1 fit; convex combinations of
            monotonic LUTs remain monotonic and pull the result back toward style.
         """
         if force_monochrome:
             return self.constrain_monochrome_smooth_monotonic_gpu(lut_grid, identity_grid)
 
-        print("    >> 最近单调投影 (PAVA, 不删点)...")
-        closest_monotonic = self.enforce_monotonicity_gpu(lut_grid, verbose=True)
-        current = closest_monotonic
+        print("    >> L1 Isotonic Regression 单调拟合 (不删点)...")
+        l1_monotonic = self.enforce_monotonicity_gpu(lut_grid, verbose=True)
+        current = l1_monotonic
 
         for iteration in range(self.SMOOTH_ITERATIONS):
             print(f"    >> 边缘保留残差平滑 {iteration + 1}/{self.SMOOTH_ITERATIONS}...")
@@ -945,9 +948,9 @@ class LUT3DGeneratorStepwise:
             )
             current = self.enforce_monotonicity_gpu(smoothed, verbose=False)
 
-            # Pull a little toward the nearest monotonic LUT to avoid over-smoothing
+            # Pull a little toward the initial L1 fit to avoid over-smoothing
             # hue/style bends that were already valid after projection.
-            current = current * 0.86 + closest_monotonic * 0.14
+            current = current * 0.86 + l1_monotonic * 0.14
 
         return torch.clamp(current, 0, self.max_val)
 
@@ -957,11 +960,11 @@ class LUT3DGeneratorStepwise:
         identity_grid: torch.Tensor,
     ) -> torch.Tensor:
         """Constrain a black-and-white LUT as one scalar gray field."""
-        print("    >> 黑白LUT: 灰阶标量三轴单调投影 (PAVA)...")
+        print("    >> 黑白LUT: 灰阶标量三轴 L1 Isotonic Regression...")
         gray_grid = self.rgb_luma_gpu(lut_grid)
         identity_gray = self.rgb_luma_gpu(identity_grid)
-        closest_monotonic = self.enforce_scalar_monotonicity_gpu(gray_grid, verbose=True)
-        current = closest_monotonic
+        l1_monotonic = self.enforce_scalar_monotonicity_gpu(gray_grid, verbose=True)
+        current = l1_monotonic
 
         for iteration in range(self.SMOOTH_ITERATIONS):
             print(f"    >> 黑白LUT: 边缘保留灰阶残差平滑 {iteration + 1}/{self.SMOOTH_ITERATIONS}...")
@@ -971,7 +974,7 @@ class LUT3DGeneratorStepwise:
                 strength=self.SMOOTH_STRENGTH,
             )
             current = self.enforce_scalar_monotonicity_gpu(smoothed, verbose=False)
-            current = current * 0.86 + closest_monotonic * 0.14
+            current = current * 0.86 + l1_monotonic * 0.14
 
         current = torch.clamp(current, 0, self.max_val)
         return current.unsqueeze(-1).expand(*current.shape, 3)
@@ -1069,34 +1072,45 @@ class LUT3DGeneratorStepwise:
         return identity_gray + residual_smoothed
 
     @staticmethod
-    def _pava_non_decreasing(seq: np.ndarray) -> np.ndarray:
-        """Closest non-decreasing sequence in unweighted L2 norm."""
-        levels = []
-        weights = []
-        starts = []
-        ends = []
+    def _l1_isotonic_lower(seq: np.ndarray) -> np.ndarray:
+        """Return the pointwise-lowest non-decreasing L1 isotonic fit."""
+        values = np.asarray(seq, dtype=np.float64)
+        result = np.empty(values.size, dtype=np.float64)
+        max_heap = []
 
-        for idx, value in enumerate(seq.astype(np.float64, copy=False)):
-            levels.append(float(value))
-            weights.append(1.0)
-            starts.append(idx)
-            ends.append(idx)
+        # This is the heap/slope-trick form of unweighted L1 isotonic
+        # regression. Duplicating each observation and removing the current
+        # maximum maintains the lower median of every active prefix.
+        for idx, value in enumerate(values):
+            value = float(value)
+            heapq.heappush(max_heap, -value)
+            heapq.heappush(max_heap, -value)
+            heapq.heappop(max_heap)
+            result[idx] = -max_heap[0]
 
-            while len(levels) >= 2 and levels[-2] > levels[-1]:
-                merged_weight = weights[-2] + weights[-1]
-                merged_level = (levels[-2] * weights[-2] + levels[-1] * weights[-1]) / merged_weight
-                levels[-2] = merged_level
-                weights[-2] = merged_weight
-                ends[-2] = ends[-1]
-                levels.pop()
-                weights.pop()
-                starts.pop()
-                ends.pop()
+        # Prefix medians may decrease. The reverse cumulative minimum turns
+        # them into the pointwise-lowest optimal isotonic sequence.
+        for idx in range(result.size - 2, -1, -1):
+            result[idx] = min(result[idx], result[idx + 1])
 
-        result = np.empty_like(seq, dtype=np.float32)
-        for level, start, end in zip(levels, starts, ends):
-            result[start:end + 1] = level
         return result
+
+    @classmethod
+    def _l1_isotonic_non_decreasing(cls, seq: np.ndarray) -> np.ndarray:
+        """Minimize sum(abs(fit - seq)) subject to a non-decreasing fit.
+
+        L1 isotonic regression can have multiple optima. The returned fit is
+        the midpoint of the pointwise-lowest and pointwise-highest solutions,
+        avoiding a systematic dark/bright bias while retaining minimum L1
+        error.
+        """
+        values = np.asarray(seq, dtype=np.float64)
+        if values.size == 0:
+            return np.empty_like(values, dtype=np.float32)
+
+        lower = cls._l1_isotonic_lower(values)
+        upper = -cls._l1_isotonic_lower(-values[::-1])[::-1]
+        return ((lower + upper) * 0.5).astype(np.float32)
 
     @staticmethod
     def _max_monotonic_violation_3d(grid_np: np.ndarray) -> float:
@@ -1113,7 +1127,7 @@ class LUT3DGeneratorStepwise:
         gray_grid: torch.Tensor,
         verbose: bool = True,
     ) -> torch.Tensor:
-        """Project a scalar LUT toward monotonicity on all three input axes."""
+        """Fit a scalar LUT monotonically on all input axes with L1 loss."""
         device = gray_grid.device
         grid_np = gray_grid.detach().cpu().numpy().astype(np.float32, copy=True)
         original_np = grid_np.copy()
@@ -1121,15 +1135,15 @@ class LUT3DGeneratorStepwise:
         for _ in range(8):
             for b in range(grid_np.shape[0]):
                 for g in range(grid_np.shape[1]):
-                    grid_np[b, g, :] = self._pava_non_decreasing(grid_np[b, g, :])
+                    grid_np[b, g, :] = self._l1_isotonic_non_decreasing(grid_np[b, g, :])
 
             for b in range(grid_np.shape[0]):
                 for r in range(grid_np.shape[2]):
-                    grid_np[b, :, r] = self._pava_non_decreasing(grid_np[b, :, r])
+                    grid_np[b, :, r] = self._l1_isotonic_non_decreasing(grid_np[b, :, r])
 
             for g in range(grid_np.shape[1]):
                 for r in range(grid_np.shape[2]):
-                    grid_np[:, g, r] = self._pava_non_decreasing(grid_np[:, g, r])
+                    grid_np[:, g, r] = self._l1_isotonic_non_decreasing(grid_np[:, g, r])
 
             if self._max_monotonic_violation_3d(grid_np) <= 1e-4:
                 break
@@ -1143,34 +1157,34 @@ class LUT3DGeneratorStepwise:
         if verbose:
             correction = np.abs(grid_np - original_np)
             print(
-                f"    灰阶单调投影修正: 平均={correction.mean():.3f}, "
+                f"    灰阶 L1 单调拟合修正: 平均={correction.mean():.3f}, "
                 f"P95={np.percentile(correction, 95):.3f}, 最大={correction.max():.3f}"
             )
 
         return torch.from_numpy(grid_np).to(device)
 
     def enforce_monotonicity_gpu(self, lut_grid: torch.Tensor, verbose: bool = True) -> torch.Tensor:
-        """Project each primary channel axis to the nearest non-decreasing sequence."""
+        """Fit each primary channel axis monotonically with minimum L1 error."""
         device = lut_grid.device
         grid_np = lut_grid.detach().cpu().numpy()
         original_np = grid_np.copy()
 
         for b in range(grid_np.shape[0]):
             for g in range(grid_np.shape[1]):
-                grid_np[b, g, :, 0] = self._pava_non_decreasing(grid_np[b, g, :, 0])
+                grid_np[b, g, :, 0] = self._l1_isotonic_non_decreasing(grid_np[b, g, :, 0])
 
         for b in range(grid_np.shape[0]):
             for r in range(grid_np.shape[2]):
-                grid_np[b, :, r, 1] = self._pava_non_decreasing(grid_np[b, :, r, 1])
+                grid_np[b, :, r, 1] = self._l1_isotonic_non_decreasing(grid_np[b, :, r, 1])
 
         for g in range(grid_np.shape[1]):
             for r in range(grid_np.shape[2]):
-                grid_np[:, g, r, 2] = self._pava_non_decreasing(grid_np[:, g, r, 2])
+                grid_np[:, g, r, 2] = self._l1_isotonic_non_decreasing(grid_np[:, g, r, 2])
 
         if verbose:
             correction = np.abs(grid_np - original_np)
             print(
-                f"    单调投影修正: 平均={correction.mean():.3f}, "
+                f"    L1 单调拟合修正: 平均={correction.mean():.3f}, "
                 f"P95={np.percentile(correction, 95):.3f}, 最大={correction.max():.3f}"
             )
 
